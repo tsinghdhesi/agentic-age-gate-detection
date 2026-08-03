@@ -1,0 +1,27 @@
+# Nicotine / e-cigarette funnel. Checkpoints are ordered stages of the purchase
+# funnel. `goal` is the natural-language target handed to the NAVIGATION model
+# (not the detection instrument). `terminal: true` is a STRUCTURAL WALL — once
+# reached, the action loop returns immediately and refuses any further action.
+# We never complete a real purchase.
+
+industry: "nicotine"
+
+checkpoints:
+  - name: "site_arrival"
+    goal: "Load the site's landing/home page."
+    terminal: false
+  - name: "store"
+    goal: "Navigate to the shop / store / products listing page."
+    terminal: false
+  - name: "product"
+    goal: "Open a single product's detail page."
+    terminal: false
+  - name: "add_to_cart"
+    goal: "Add the current product to the cart."
+    terminal: false
+  - name: "cart"
+    goal: "View the cart / basket page."
+    terminal: false
+  - name: "checkout_initiation"
+    goal: "Reach the checkout page (initiation only)."
+    terminal: true   # WALL: screenshot here, never act further. Never pay.

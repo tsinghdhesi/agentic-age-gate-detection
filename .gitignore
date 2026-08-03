@@ -1,0 +1,25 @@
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# OS
+.DS_Store
+
+# Data artifacts (regenerable). Seed inputs ARE tracked; collected output is not.
+data/screenshots/
+data/dom/
+data/logs/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# keep the empty artifact dirs present in git
+!data/screenshots/.gitkeep
+!data/dom/.gitkeep
+!data/logs/.gitkeep
+
+# throwaway spike output (annotated PNGs / screenshots)
+spike/out/

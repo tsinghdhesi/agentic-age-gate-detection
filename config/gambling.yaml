@@ -1,0 +1,26 @@
+# Gambling funnel — STUB. Seed data not yet supplied. The gambling funnel often
+# differs (registration/deposit rather than cart/checkout); revisit the stages
+# when gambling sites are added. A terminal wall still applies to whatever the
+# real-money commitment step is.
+
+industry: "gambling"
+
+checkpoints:
+  - name: "site_arrival"
+    goal: "Load the site's landing/home page."
+    terminal: false
+  - name: "store"
+    goal: "Navigate to the games / sportsbook / lobby section."
+    terminal: false
+  - name: "product"
+    goal: "Open a specific game or betting market."
+    terminal: false
+  - name: "add_to_cart"
+    goal: "Begin a stake / bet-slip / deposit selection."
+    terminal: false
+  - name: "cart"
+    goal: "View the bet slip / deposit summary."
+    terminal: false
+  - name: "checkout_initiation"
+    goal: "Reach the deposit / place-bet confirmation page (initiation only)."
+    terminal: true

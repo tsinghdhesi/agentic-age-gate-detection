@@ -1,0 +1,25 @@
+# Alcohol funnel — STUB. Seed data not yet supplied. The default funnel mirrors
+# vape.yaml as a starting point; tune the goals/stages when alcohol sites are
+# added. checkout_initiation stays terminal (structural no-purchase wall).
+
+industry: "alcohol"
+
+checkpoints:
+  - name: "site_arrival"
+    goal: "Load the site's landing/home page."
+    terminal: false
+  - name: "store"
+    goal: "Navigate to the shop / store / products listing page."
+    terminal: false
+  - name: "product"
+    goal: "Open a single product's detail page."
+    terminal: false
+  - name: "add_to_cart"
+    goal: "Add the current product to the cart."
+    terminal: false
+  - name: "cart"
+    goal: "View the cart / basket page."
+    terminal: false
+  - name: "checkout_initiation"
+    goal: "Reach the checkout page (initiation only)."
+    terminal: true

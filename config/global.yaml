@@ -1,0 +1,50 @@
+# Global operational knobs. Read by most scripts. Operational only —
+# the frozen detection prompt is NOT here (it's a measurement instrument,
+# stored + hashed in its own module).
+
+# Local Ollama only. There is no cloud fallback, ever.
+ollama:
+  host: "http://localhost:11434"
+
+# Model tags. NOTE: as of scaffolding only qwen3-vl:8b is pulled locally;
+# pull 30b/32b before the Phase-4 three-model comparison.
+models:
+  navigation: "qwen3-vl:8b"        # used live by 02_collect.py
+  detection_default: "qwen3-vl:8b" # 03_classify.py --model overrides this
+  detection_pool:                  # the three-model comparison set
+    - "qwen3-vl:8b"
+    - "qwen3-vl:30b"
+    - "qwen3-vl:32b"
+
+# Which stored PNG the DETECTION pass feeds the model. Re-classification only —
+# both captures are always stored at collection time, so flipping this never
+# requires a re-crawl. Navigation capture is fixed and not configurable.
+capture:
+  detection_capture: "full_page"   # full_page | viewport  (03_classify reads this)
+  navigation_capture: "viewport"   # FIXED — do not change
+
+# Real viewport in pixels. coords.py rescales the model's 1000x1000 canvas to this.
+viewport:
+  width: 1280
+  height: 800
+
+# Navigation action loop controls.
+loop:
+  step_cap: 6            # max model actions per checkpoint
+  no_progress_limit: 2   # unchanged URL+DOM-hash for N actions -> stuck
+
+# Human-timed pacing (seconds). Heavy-tailed dwell between actions; Poisson
+# inter-site gaps. Tuned later during live testing.
+delays:
+  dwell_min_s: 0.4
+  dwell_max_s: 3.0
+  inter_site_poisson_mean_s: 45
+
+# Serial bot-evasion housekeeping.
+browser:
+  restart_every_n_sites: 20
+  restart_after_consecutive_blocks: 2   # count blocked_bot only, NOT no_such_stage
+
+# IP rotation is a stub/hook only and is OFF. Do not implement rotation now.
+ip_rotation:
+  enabled: false
