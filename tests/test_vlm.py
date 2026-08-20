@@ -8,7 +8,55 @@ prompt/format construction and response parsing.
 
 from unittest.mock import MagicMock, patch
 
-from common.vlm import _parse_relevance, classify_relevance
+from common.vlm import _normalize_box, _parse_nav, _parse_relevance, classify_relevance
+
+
+# --------------------------------------------------------------------------- #
+# _parse_nav / _normalize_box — box-shape tolerance.
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_nav_accepts_four_element_box():
+    action, box, text = _parse_nav('{"action": "click", "box": [10, 20, 30, 40]}')
+    assert action == "click"
+    assert box == [10, 20, 30, 40]
+
+
+def test_parse_nav_accepts_two_element_point():
+    # Regression: Qwen3-VL frequently returns a POINT [x,y] instead of a
+    # 4-element box. Observed live in the navigation spike — the model
+    # correctly located an age-gate button but the point was rejected,
+    # silently downgrading a good click to "stuck" and stalling the crawl.
+    action, box, text = _parse_nav('{"action": "click", "box": [498, 501]}')
+    assert action == "click"
+    assert box == [498, 501, 498, 501]  # degenerate box; centre == the point
+
+
+def test_normalize_box_point_centre_is_the_point():
+    from common.coords import box_center_to_pixel
+
+    box = _normalize_box([500, 500])
+    # Centre of the widened box must be the original point, so a point-style
+    # answer clicks exactly where the model pointed.
+    assert box_center_to_pixel(box, 1000, 1000) == (500.0, 500.0)
+
+
+def test_parse_nav_rejects_malformed_boxes():
+    for bad in ("[1,2,3]", "[1,2,3,4,5]", '["a","b","c","d"]', "null", '"nope"', "{}"):
+        _action, box, _text = _parse_nav(f'{{"action": "scroll", "box": {bad}}}')
+        assert box is None, bad
+
+
+def test_parse_nav_click_without_box_is_stuck():
+    action, box, _ = _parse_nav('{"action": "click"}')
+    assert action == "stuck"
+    assert box is None
+
+
+def test_parse_nav_booleans_are_not_valid_coordinates():
+    # bool is a subclass of int in Python — must not slip through as a coord.
+    _action, box, _text = _parse_nav('{"action": "click", "box": [true, false]}')
+    assert box is None
 
 
 def _fake_client(response_text: str, thinking_text: str = ""):

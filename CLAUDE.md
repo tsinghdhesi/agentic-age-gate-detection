@@ -80,7 +80,7 @@ loop. Never re-derive the math inline.
   checkpoint, so `detection_capture` (in `global.yaml`) is a re-classification
   toggle, never a re-crawl. `navigation_capture` is fixed at viewport.
 
-## Data model (SQLite, [common/db.py](common/db.py), SCHEMA_VERSION 3)
+## Data model (SQLite, [common/db.py](common/db.py), SCHEMA_VERSION 4)
 Collection facts and classification labels are split on purpose — do not merge.
 - `runs` — run_id, started/finished, config_hash, detection_prompt_hash, ...
 - `sites` — crawl queue (see locked decisions). `included`-gated. v2 added
@@ -91,7 +91,11 @@ Collection facts and classification labels are split on purpose — do not merge
   `relevance_ruleset` (INTEGER — a deterministic-classifier concept) with
   `relevance_model`/`relevance_prompt_hash` TEXT, mirroring `detections`'
   `model`/`detection_prompt_hash` provenance now that 01b's judgment is an
-  LLM call, not a keyword ruleset. `upsert_site()` is the FRAME writer only
+  LLM call, not a keyword ruleset. v4 added `relevance_fetch_mode`
+  (`'http'` | `'browser'`) recording whether a label came from the plain HTTP
+  GET or from the JS-render browser fallback, so the ~2% of sites that are
+  invisible to a plain fetch are identifiable in the data rather than
+  silently indistinguishable. `upsert_site()` is the FRAME writer only
   (site_id, host, cctld, ...) — it never touches these relevance/sampling
   columns directly, so a re-run of `01_build_queue` structurally cannot wipe
   a relevance screen or a sample draw. `init_db()` raises
@@ -159,7 +163,9 @@ other 1.0%, na 0.9%.
 - Validated live: blank→0, synthetic gate→1; nav click on a YES button rescaled
   to within ~2px of its true center via `coords`.
 - **Relevance prompt hash — FROZEN** (model = `qwen3.6:27b`):
-  `ffd9b7b74020e958614ddcc6c4485e2986e28adffdec16fb995f9d0f1233c2f8`.
+  `ad59a3d194fe2deec67c68d043340a1f7bc5bf4c5886361822caa7d93113a2d7`.
+  (Superseded `ffd9b7b7…` after the maintenance-rule fix below; nothing had
+  been screened under the old hash, so no data was invalidated.)
   Validated on `spike/spike_relevance.py`'s hand-verified set: 13/13 correct
   on genuine judgment calls (2 apparent mismatches were non-classifier
   artifacts — a JS-rendered storefront whose real content never reaches a
@@ -171,7 +177,28 @@ other 1.0%, na 0.9%.
   matches; (2) an explicit instruction that "under construction"/"coming
   soon"/parked-domain placeholders classify as `unrelated` regardless of
   what the domain name implies, since the model was initially over-weighting
-  the domain/title over the page's actual (empty) content.
+  the domain/title over the page's actual (empty) content. A third fix
+  followed the n=150 gold-set scoring: rule (2) was too blunt and sent a
+  real vape shop showing a maintenance banner *over its full catalogue nav*
+  (vapebuddy.ch) to `unrelated`, so the rule now distinguishes a
+  placeholder-ONLY page from a working shop that is briefly down.
+- **Relevance scored against the hand-labeled gold set** (n=150,
+  `data/labels/relevance_goldset_claude-handlabeled_n150.txt`).
+  Before the maintenance-rule fix and browser fallback: P .979 / R .922 /
+  F1 .949. **After both: precision .980 / recall .980 / F1 .980**
+  (TP=50 FN=1 FP=1 TN=98). Three rows flipped, all correct, none regressed:
+  `musthavetobacco.ru` (via browser render), `vapebuddy.ch` (maintenance
+  rule), `rainbowvapes.co.uk` (a transient fetch failure that recovered).
+  Recall is flat across languages — 28/30 non-English-market ccTLDs vs 19/21
+  English — the multilingual bias risk retired empirically.
+  Browser fallback fired on 7/150 sites (4.7%) and was correct on all 7, so
+  it recovers the blind spot without costing precision.
+  Two residual errors, both defensible: `bookmysmoke.com` (a BORDERLINE
+  hookah-RENTAL service — arguably a gold-label judgment call, not a model
+  error) and `legal.blinkersvape.co` (an Indonesian gambling portal squatting
+  a vape domain with vape-flavoured marketing copy — deceptive by design).
+  Throughput 5.6s/site end-to-end (median LLM latency 3.2s) → full-frame
+  screen ≈ 7.5 days serial.
 - `classify_relevance()` is a TEXT-only call — no `images=` kwarg, unlike
   `detect_age_gate()`/`decide_navigation()`. `_parse_relevance()` and
   `_parse_nav()` both had a latent crash bug: `json.loads()` succeeds on any
@@ -181,12 +208,51 @@ other 1.0%, na 0.9%.
   calling `.get()` — a single malformed model response must never crash a
   multi-day screen or a live navigation loop.
 
+## Navigation findings (spike/spike_navigation.py — READ BEFORE BUILDING 02_collect)
+First code that actually executes actions; `spike_grounding.py` only ever drew
+a crosshair. Run over 8 gold-set retailers, walking
+`site_arrival → store → product → add_to_cart` (deliberately stops before the
+terminal checkpoint). Depth reached: **site_arrival 8/8, store 5/8, product
+4/8, add_to_cart 2/8.**
+
+1. **Qwen3-VL often returns a 2-element POINT `[x,y]` instead of the 4-element
+   box the prompt asks for.** `_parse_nav` required exactly 4 and silently
+   downgraded those to `stuck` — on the first site tested, the model had
+   correctly located the age-gate button and the click was thrown away.
+   `vlm._normalize_box()` now widens a point to `[x,y,x,y]`, whose centre is
+   the point, so `coords.box_center_to_pixel()` is unchanged. Regression tests
+   in `tests/test_vlm.py`.
+2. **Age gates block the crawl** — the thing being measured is also an
+   obstacle. A gate modal swallows clicks aimed at the nav behind it. The
+   navigation prompt (NOT a frozen instrument) now instructs: dismiss blocking
+   overlays first via the AFFIRMATIVE control, never the "No/exit" one, in any
+   language, and never attempt a CAPTCHA (invariant #2). This is
+   methodologically clean — the checkpoint screenshot captures the gate before
+   it is dismissed, and detection is a downstream pass (invariant #5).
+3. **The model would not stop when the goal was met** — it reached the store
+   listing, then filtered, wandered to the delivery page and back. That is a
+   DATA-QUALITY bug, not just wasted time: the page on screen when the loop
+   ends is the page recorded for that checkpoint. The prompt now makes
+   "is the goal ALREADY satisfied? → done" the explicit first step.
+4. **`loop.step_cap: 6` is NOT the binding constraint.** Every one of the 11
+   successful checkpoints converged in ≤3 steps. All three `step_cap`
+   failures had progressed on 100% of their clicks — they were looping
+   (catalog → filter → catalog → delivery → catalog), not running out of
+   budget. Raising the cap would only buy more wandering.
+   **Design implication for 02_collect:** `no_progress_limit` only catches
+   *unchanged* URL+DOM, so it cannot see this loop. Add a **URL-revisit
+   detector** — returning to a URL already seen within the same checkpoint is
+   the real stuck signal here.
+5. Executed actions changed the page 69% of the time (38/44). Median nav
+   latency 2.7s; per-site funnel walk ≈35s for this 4-checkpoint prefix.
+
 ## How to run (so far)
 - Tests: `./.venv/bin/python -m pytest -q`
 - Init DB: `./.venv/bin/python -c "from common import db; c=db.connect(); db.init_db(c)"`
 - Grounding spike: `./.venv/bin/python spike/spike_grounding.py` (`--mode som` for Set-of-Mark)
 - Detection spike: `./.venv/bin/python spike/spike_detection.py`
 - Relevance spike: `./.venv/bin/python spike/spike_relevance.py`
+- Navigation spike: `./.venv/bin/python spike/spike_navigation.py` (`--headful` to watch)
 - Build queue: `./.venv/bin/python scripts/01_build_queue.py`
 - Screen relevance: `./.venv/bin/python scripts/01b_screen_relevance.py --limit N`
 - Draw sample: `./.venv/bin/python scripts/01c_draw_sample.py --dry-run` (review before a real draw)

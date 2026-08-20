@@ -54,12 +54,63 @@ from typing import Iterable, Iterator, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from common import config, db  # noqa: E402
+from common import config, db, stealth  # noqa: E402
 from common.prompts import RELEVANCE_PROMPT_HASH  # noqa: E402
 from common.relevance import FetchResult, classify_page, fetch  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HTML_DIR = REPO_ROOT / "data" / "html"
+
+
+class _BrowserRenderer:
+    """Lazily-started stealth browser used ONLY to re-render pages whose plain
+    HTTP fetch came back with almost no text (fully JS-rendered storefronts).
+
+    Injected into common.relevance.classify_page() as `render_fn` so that
+    relevance.py — the deliberately browser-free HTTP layer — never imports
+    Playwright. The browser is started on first actual need and reused, so a
+    run where nothing is thin never pays to launch Chromium at all.
+    """
+
+    def __init__(self, cfg: dict):
+        self._cfg = cfg
+        self._cm = None
+        self._browser = None
+        self.renders = 0
+
+    def _ensure(self) -> None:
+        if self._browser is None:
+            self._cm = stealth.stealth_playwright()
+            p = self._cm.__enter__()
+            self._browser = stealth.launch_browser(p, headless=True)
+
+    def render(self, url: str) -> Optional[str]:
+        """Return rendered HTML, or None on any failure — a browser problem
+        must degrade to 'classify what HTTP gave us', never kill the screen."""
+        try:
+            self._ensure()
+            ctx = self._browser.new_context()
+            try:
+                page = ctx.new_page()
+                page.goto(url, wait_until="domcontentloaded",
+                          timeout=self._cfg["browser_timeout_ms"])
+                page.wait_for_timeout(self._cfg["browser_settle_ms"])
+                html = page.content()
+                self.renders += 1
+                return html
+            finally:
+                ctx.close()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def close(self) -> None:
+        try:
+            if self._browser is not None:
+                self._browser.close()
+            if self._cm is not None:
+                self._cm.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _html_path(site_id: str) -> Path:
@@ -99,6 +150,16 @@ def _interleave_by_stratum(rows: Iterable) -> Iterator:
                 yield groups[s].popleft()
 
 
+def _classify_kwargs(relevance_cfg: dict, renderer: Optional[_BrowserRenderer]) -> dict:
+    """Shared classify_page() options for both the live and --reclassify paths."""
+    enabled = relevance_cfg.get("browser_fallback") and renderer is not None
+    return dict(
+        max_body_chars=relevance_cfg["max_body_chars"],
+        thin_text_threshold=relevance_cfg["thin_text_threshold"] if enabled else 0,
+        render_fn=renderer.render if enabled else None,
+    )
+
+
 def _to_row(result: dict, relevance_cfg: dict, http_status: Optional[int]) -> dict:
     """Shared result -> db.set_site_relevance kwargs mapping for both the
     live-fetch and --reclassify paths. `category=None` (LLM response
@@ -118,11 +179,13 @@ def _to_row(result: dict, relevance_cfg: dict, http_status: Optional[int]) -> di
         included=included,
         relevance_model=result["model"],
         relevance_prompt_hash=RELEVANCE_PROMPT_HASH,
+        relevance_fetch_mode=result.get("fetch_mode"),
         http_status=http_status,
     )
 
 
-def _screen_one(site: object, relevance_cfg: dict) -> dict:
+def _screen_one(site: object, relevance_cfg: dict,
+                renderer: Optional[_BrowserRenderer] = None) -> dict:
     """Fetch + classify one site. Returns kwargs for db.set_site_relevance."""
     fr = fetch(
         site["url_normalized"],
@@ -133,18 +196,28 @@ def _screen_one(site: object, relevance_cfg: dict) -> dict:
     if fr.html is not None:
         _store_html(site["site_id"], fr.html)
 
-    result = classify_page(fr, max_body_chars=relevance_cfg["max_body_chars"])
+    result = classify_page(fr, url=site["url_normalized"],
+                           **_classify_kwargs(relevance_cfg, renderer))
     return _to_row(result, relevance_cfg, fr.http_status)
 
 
-def _reclassify_one(site: object, relevance_cfg: dict) -> Optional[dict]:
-    """Re-score already-stored HTML — no network. None if nothing is stored
-    (the site previously failed to fetch; nothing to reclassify yet)."""
+def _reclassify_one(site: object, relevance_cfg: dict,
+                    renderer: Optional[_BrowserRenderer] = None) -> Optional[dict]:
+    """Re-score already-stored HTML. None if nothing is stored (the site
+    previously failed to fetch; nothing to reclassify yet).
+
+    NOTE: with browser_fallback on, a thin stored page WILL trigger a live
+    re-render, so --reclassify is not strictly network-free for that subset.
+    That is deliberate — re-scoring a JS shell against a revised prompt would
+    otherwise just reproduce the original miss.
+    """
     html = _load_html(site["site_id"])
     if html is None:
         return None
-    fr = FetchResult(html=html, http_status=site["http_status"], final_url=None, failure_reason=None)
-    result = classify_page(fr, max_body_chars=relevance_cfg["max_body_chars"])
+    fr = FetchResult(html=html, http_status=site["http_status"],
+                     final_url=site["url_normalized"], failure_reason=None)
+    result = classify_page(fr, url=site["url_normalized"],
+                           **_classify_kwargs(relevance_cfg, renderer))
     return _to_row(result, relevance_cfg, site["http_status"])
 
 
@@ -154,11 +227,14 @@ def main() -> None:
     ap.add_argument("--industry", default=None)
     ap.add_argument("--limit", type=int, default=None, help="stop after N sites this invocation")
     ap.add_argument("--retry-failed", action="store_true", help="also re-screen unreachable/blocked/error sites")
-    ap.add_argument("--reclassify", action="store_true", help="re-score stored HTML only — NO network calls (still an LLM call per site)")
+    ap.add_argument("--reclassify", action="store_true", help="re-score stored HTML (still an LLM call per site; thin pages may re-render)")
+    ap.add_argument("--no-browser-fallback", action="store_true", help="disable the JS re-render for thin pages")
     ap.add_argument("--dry-run", action="store_true", help="report the work queue size and exit")
     args = ap.parse_args()
 
-    relevance_cfg = config.load_global()["relevance"]
+    relevance_cfg = dict(config.load_global()["relevance"])
+    if args.no_browser_fallback:
+        relevance_cfg["browser_fallback"] = False
 
     conn = db.connect(args.db)
     db.init_db(conn)
@@ -169,9 +245,11 @@ def main() -> None:
     ))
     pending = list(_interleave_by_stratum(pending))
 
+    fb = "on" if relevance_cfg.get("browser_fallback") else "off"
     print(f"01b_screen_relevance — model={config.load_global()['models']['relevance']} "
-          f"prompt_hash={RELEVANCE_PROMPT_HASH[:12]} pending={len(pending)}"
-          f"{'  [RECLASSIFY, no network]' if args.reclassify else ''}"
+          f"prompt_hash={RELEVANCE_PROMPT_HASH[:12]} pending={len(pending)} "
+          f"browser_fallback={fb}"
+          f"{'  [RECLASSIFY]' if args.reclassify else ''}"
           f"{'  [DRY RUN]' if args.dry_run else ''}")
 
     if args.dry_run:
@@ -184,16 +262,17 @@ def main() -> None:
     processed = skipped = 0
     label_counts: dict = {}
     include_categories = set(relevance_cfg["include_categories"])
+    renderer = _BrowserRenderer(relevance_cfg) if relevance_cfg.get("browser_fallback") else None
     t0 = time.time()
 
     for i, site in enumerate(pending, start=1):
         if args.reclassify:
-            result = _reclassify_one(site, relevance_cfg)
+            result = _reclassify_one(site, relevance_cfg, renderer)
             if result is None:
                 skipped += 1
                 continue
         else:
-            result = _screen_one(site, relevance_cfg)
+            result = _screen_one(site, relevance_cfg, renderer)
             time.sleep(relevance_cfg["inter_request_delay_s"])
 
         db.set_site_relevance(conn, site["site_id"], **result)
@@ -209,10 +288,14 @@ def main() -> None:
             print(f"  {i}/{len(pending)}  {rate:.2f}s/site  included={included_so_far} ({yield_pct:.1f}% yield)")
 
     conn.close()
+    if renderer is not None:
+        renderer.close()
 
     dt = time.time() - t0
     print(f"\nprocessed {processed} sites in {dt:.1f}s ({dt/max(1, processed):.2f}s/site avg)"
           + (f", skipped {skipped} (no stored HTML)" if skipped else ""))
+    if renderer is not None:
+        print(f"browser re-renders (thin pages): {renderer.renders}")
     print("label breakdown:")
     for label, count in sorted(label_counts.items(), key=lambda kv: -kv[1]):
         print(f"  {label:20} {count}")

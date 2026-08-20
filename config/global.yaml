@@ -75,6 +75,17 @@ relevance:
   inter_request_delay_s: 1.0        # polite spacing between hosts, one GET each
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
   max_body_chars: 3000              # truncate extracted body text fed to the LLM
+  # JS-render fallback. A plain HTTP GET sees nothing on a fully client-rendered
+  # storefront — measured: musthavetobacco.ru returns 0 chars of text but is
+  # visibly a shisha tobacco brand, and was the only unambiguous classifier miss
+  # in the 150-site gold set. Pages whose extracted text is shorter than
+  # thin_text_threshold get re-rendered in the stealth browser and re-extracted.
+  # Only the thin subset pays the browser cost. sites.relevance_fetch_mode
+  # records which path produced each label.
+  browser_fallback: true
+  thin_text_threshold: 200          # chars of title+meta+h1+body below which we re-render
+  browser_timeout_ms: 20000
+  browser_settle_ms: 3500
   include_categories:
     - "retailer"
     - "brand_manufacturer"

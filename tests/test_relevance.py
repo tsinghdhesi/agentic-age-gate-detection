@@ -409,6 +409,96 @@ def test_classify_page_calls_llm_on_normal_page():
     assert "Buy vapes here" in called_text
 
 
+def test_extract_fields_and_text_volume():
+    from common.relevance import extract_fields, text_volume
+
+    html = "<html><head><title>T</title><meta name='description' content='M'></head><body><h1>H</h1><p>B</p></body></html>"
+    title, meta, h1, body = extract_fields(html)
+    assert title == "T" and meta == "M" and h1 == "H" and "B" in body
+    assert text_volume(title, meta, h1, body) > 0
+    # Never raises on garbage.
+    assert extract_fields("<<<>>>") is not None
+    assert text_volume("", "", "", "") == 0
+
+
+# --------------------------------------------------------------------------- #
+# JS browser fallback — the ~2% blind spot fix. render_fn is injected so
+# relevance.py itself never imports Playwright.
+# --------------------------------------------------------------------------- #
+
+
+def test_browser_fallback_fires_on_thin_page_and_adopts_render():
+    # Regression for musthavetobacco.ru: 0 chars over plain HTTP, but a real
+    # shisha tobacco brand once rendered. Without the fallback this is the
+    # single unambiguous miss in the 150-site gold set.
+    thin = "<html><body><div id='app'></div></body></html>"
+    rendered = "<html><head><title>Shisha Tobacco Brand</title></head><body><p>Our tobacco flavours and where to buy them.</p></body></html>"
+    fr = FetchResult(html=thin, http_status=200, final_url=None, failure_reason=None)
+
+    with patch(
+        "common.relevance.classify_relevance",
+        return_value={"category": "brand_manufacturer", "raw": "{}", "latency_ms": 10, "model": "m"},
+    ) as mock_llm:
+        result = classify_page(fr, url="https://x.example/", thin_text_threshold=200,
+                               render_fn=lambda _u: rendered)
+
+    assert result["fetch_mode"] == "browser"
+    # The LLM must have been given the RENDERED text, not the empty shell.
+    assert "Shisha Tobacco Brand" in mock_llm.call_args[0][0]
+
+
+def test_browser_fallback_not_used_when_page_has_enough_text():
+    html = "<html><head><title>Vape Shop</title></head><body><p>" + ("plenty of real text " * 40) + "</p></body></html>"
+    fr = FetchResult(html=html, http_status=200, final_url=None, failure_reason=None)
+    called = []
+    with patch("common.relevance.classify_relevance",
+               return_value={"category": "retailer", "raw": "{}", "latency_ms": 5, "model": "m"}):
+        result = classify_page(fr, url="https://x.example/", thin_text_threshold=200,
+                               render_fn=lambda u: called.append(u) or "<html></html>")
+    assert called == []           # browser never launched
+    assert result["fetch_mode"] == "http"
+
+
+def test_browser_fallback_render_failure_degrades_gracefully():
+    # A browser problem must never kill the screen — fall back to classifying
+    # whatever plain HTTP gave us.
+    fr = FetchResult(html="<html><body></body></html>", http_status=200, final_url=None, failure_reason=None)
+    with patch("common.relevance.classify_relevance",
+               return_value={"category": "unrelated", "raw": "{}", "latency_ms": 5, "model": "m"}):
+        result = classify_page(fr, url="https://x.example/", thin_text_threshold=200,
+                               render_fn=lambda _u: None)
+    assert result["fetch_mode"] == "http"
+    assert result["category"] == "unrelated"
+
+
+def test_browser_fallback_rejects_render_that_recovers_no_text():
+    # If the render is no better than the shell, keep the http mode rather
+    # than claiming a browser-sourced label.
+    fr = FetchResult(html="<html><body>ab</body></html>", http_status=200, final_url=None, failure_reason=None)
+    with patch("common.relevance.classify_relevance",
+               return_value={"category": "unrelated", "raw": "{}", "latency_ms": 5, "model": "m"}):
+        result = classify_page(fr, url="https://x.example/", thin_text_threshold=200,
+                               render_fn=lambda _u: "<html><body></body></html>")
+    assert result["fetch_mode"] == "http"
+
+
+def test_browser_fallback_disabled_when_threshold_zero():
+    fr = FetchResult(html="<html><body></body></html>", http_status=200, final_url=None, failure_reason=None)
+    called = []
+    with patch("common.relevance.classify_relevance",
+               return_value={"category": "unrelated", "raw": "{}", "latency_ms": 5, "model": "m"}):
+        classify_page(fr, url="https://x.example/", thin_text_threshold=0,
+                      render_fn=lambda u: called.append(u) or "<html></html>")
+    assert called == []
+
+
+def test_fetch_failure_reports_http_fetch_mode():
+    fr = FetchResult(html=None, http_status=None, final_url=None, failure_reason="timeout")
+    result = classify_page(fr, thin_text_threshold=200, render_fn=lambda _u: "<html></html>")
+    assert result["category"] == "unreachable"
+    assert result["fetch_mode"] == "http"
+
+
 def test_classify_page_passes_through_none_category_from_llm():
     # An unparseable LLM response (category=None) must not be silently
     # coerced to "unrelated" by classify_page — that's the caller's call.

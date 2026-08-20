@@ -22,7 +22,10 @@ from typing import Iterator, Optional
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = REPO_ROOT / "data" / "agegate.sqlite"
 
-SCHEMA_VERSION = 3  # v3: sites.relevance_ruleset (INTEGER, a deterministic-
+SCHEMA_VERSION = 4  # v4: sites.relevance_fetch_mode ('http'|'browser') records
+                    # whether a label came from the plain HTTP GET or from the
+                    # JS-render browser fallback (see common/relevance.py).
+                    # v3: sites.relevance_ruleset (INTEGER, a deterministic-
                     # classifier concept) replaced by relevance_model +
                     # relevance_prompt_hash — mirrors detections' model +
                     # detection_prompt_hash now that 01b's judgment is an LLM
@@ -103,6 +106,7 @@ CREATE TABLE IF NOT EXISTS sites (
     relevance_score      REAL,                    -- classify_html() score IF that legacy path is ever used
     relevance_model      TEXT,                    -- which Ollama model produced this label
     relevance_prompt_hash TEXT,                   -- which frozen RELEVANCE_PROMPT produced this
+    relevance_fetch_mode TEXT,                    -- 'http' | 'browser' (JS-render fallback)
     relevance_ts        TEXT,
     http_status          INTEGER,                 -- from the relevance-screen fetch
     sample_u             REAL,                    -- deterministic draw variate; write-once
@@ -355,6 +359,7 @@ def set_site_relevance(
     relevance_score: Optional[float] = None,
     relevance_model: Optional[str] = None,
     relevance_prompt_hash: Optional[str] = None,
+    relevance_fetch_mode: Optional[str] = None,
     http_status: Optional[int] = None,
 ) -> None:
     """The narrow writer for 01b_screen_relevance.py — keeps relevance
@@ -368,12 +373,13 @@ def set_site_relevance(
             relevance_score        = ?,
             relevance_model        = ?,
             relevance_prompt_hash  = ?,
+            relevance_fetch_mode   = ?,
             relevance_ts           = ?,
             http_status            = ?
         WHERE site_id = ?
         """,
         (relevance_label, included, relevance_score, relevance_model,
-         relevance_prompt_hash, now_iso(), http_status, site_id),
+         relevance_prompt_hash, relevance_fetch_mode, now_iso(), http_status, site_id),
     )
     conn.commit()
 

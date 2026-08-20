@@ -153,14 +153,38 @@ def _parse_nav(raw: str):
     action = obj.get("action")
     if action not in _VALID_ACTIONS:
         return ("stuck", None, "")
-    box = obj.get("box")
-    if not (isinstance(box, list) and len(box) == 4):
-        box = None
+    box = _normalize_box(obj.get("box"))
     text = obj.get("text") or ""
     # click/type without a usable target can't be executed → treat as stuck.
     if action in ("click", "type") and box is None:
         return ("stuck", None, text)
     return (action, box, text)
+
+
+def _normalize_box(box: Any) -> Optional[list]:
+    """Accept both box shapes the model actually emits, return a 4-element box.
+
+    Qwen3-VL frequently answers with a 2-element POINT [x, y] rather than the
+    4-element [x1, y1, x2, y2] the prompt asks for — observed live in the
+    navigation spike, where it correctly located an age-gate button but
+    returned a point. Rejecting those silently downgraded a perfectly good
+    click to "stuck", which would have stalled the crawl on any site with a
+    blocking overlay.
+
+    A point is widened to the degenerate box [x, y, x, y], whose centre is the
+    point itself — so common.coords.box_center_to_pixel() keeps working
+    unchanged and every downstream caller keeps its 4-element contract.
+    """
+    if not isinstance(box, list):
+        return None
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in box):
+        return None
+    if len(box) == 4:
+        return box
+    if len(box) == 2:
+        x, y = box
+        return [x, y, x, y]
+    return None
 
 
 _VALID_RELEVANCE_CATEGORIES = {

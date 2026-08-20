@@ -467,39 +467,92 @@ def build_relevance_text(title: str, meta_desc: str, h1: str, body: str, *, max_
     return "\n".join(parts)
 
 
+def extract_fields(html: str) -> tuple[str, str, str, str]:
+    """(title, meta_description, h1, body_text) from raw HTML. Never raises —
+    malformed HTML must not crash a multi-day screen.
+    """
+    extractor = _Extractor()
+    try:
+        extractor.feed(html)
+    except Exception:  # noqa: BLE001
+        pass
+    return (
+        "".join(extractor.title).strip(),
+        (extractor.meta_description or "").strip(),
+        "".join(extractor.h1).strip(),
+        "".join(extractor.body_text),
+    )
+
+
+def text_volume(title: str, meta_desc: str, h1: str, body: str) -> int:
+    """How much usable text a page yielded. Drives the thin-page decision."""
+    return len(f"{title} {meta_desc} {h1} {body}".strip())
+
+
 def classify_page(
-    fetch_result: FetchResult, *, model: Optional[str] = None, max_body_chars: int = 3000
+    fetch_result: FetchResult,
+    *,
+    model: Optional[str] = None,
+    max_body_chars: int = 3000,
+    thin_text_threshold: int = 0,
+    render_fn=None,
+    url: Optional[str] = None,
 ) -> dict:
     """Full relevance judgment for one already-fetched page: fetch-failure
-    passthrough -> deterministic block-page pre-check -> LLM
-    classify_relevance() on the extracted text. This is the single function
-    01b_screen_relevance.py and spike/spike_relevance.py both call, so the
-    two can't drift out of sync.
+    passthrough -> deterministic block-page pre-check -> optional browser
+    re-render for thin pages -> LLM classify_relevance() on the extracted
+    text. This is the single function 01b_screen_relevance.py and
+    spike/spike_relevance.py both call, so the two can't drift out of sync.
 
-    Returns: {category, raw, latency_ms, model}. `raw`/`latency_ms`/`model`
-    are None for the two paths that never reach the LLM (fetch failure,
-    block page) — there was no LLM call to report on. `category` can also
-    be None if the LLM's response was unparseable (see vlm._parse_relevance)
-    — never silently coerced to "unrelated"; the caller decides how to
-    record that.
+    `render_fn` is dependency injection, deliberately: this module is the
+    no-browser HTTP layer and must not import Playwright. The caller (01b)
+    supplies `render_fn(url) -> html | None` built on common.stealth, so the
+    browser cost is paid ONLY on pages whose plain-HTTP text came back under
+    `thin_text_threshold` characters.
+
+    Why the fallback exists: measured against the hand-labeled gold set,
+    musthavetobacco.ru returned ZERO characters of HTML text but is visibly a
+    shisha tobacco brand site — the single unambiguous classifier miss in 150
+    sites. Fully JS-rendered storefronts are invisible to a plain GET, and
+    losing them is directional (it selectively drops modern shops), not
+    random noise.
+
+    Returns: {category, raw, latency_ms, model, fetch_mode}. `fetch_mode` is
+    "http" or "browser" and is persisted to sites.relevance_fetch_mode so the
+    provenance of every label records which path produced it.
+    `raw`/`latency_ms`/`model` are None on the two paths that never reach the
+    LLM (fetch failure, block page). `category` can be None if the LLM's
+    response was unparseable — never silently coerced to "unrelated".
     """
     if fetch_result.failure_reason:
         label = _FETCH_FAILURE_TO_LABEL.get(fetch_result.failure_reason, "error")
-        return {"category": label, "raw": None, "latency_ms": None, "model": None}
+        return {"category": label, "raw": None, "latency_ms": None,
+                "model": None, "fetch_mode": "http"}
 
-    extractor = _Extractor()
-    try:
-        extractor.feed(fetch_result.html)
-    except Exception:  # noqa: BLE001 — malformed HTML must not crash the screen
-        pass
-    title = "".join(extractor.title).strip()
-    h1 = "".join(extractor.h1).strip()
-    meta_desc = extractor.meta_description or ""
-    body = "".join(extractor.body_text)
+    fetch_mode = "http"
+    title, meta_desc, h1, body = extract_fields(fetch_result.html)
+
+    # Thin page -> re-render with a real browser and re-extract. Done BEFORE
+    # the block-marker check so a JS-delivered block page is still caught.
+    if (
+        render_fn is not None
+        and thin_text_threshold > 0
+        and text_volume(title, meta_desc, h1, body) < thin_text_threshold
+    ):
+        target = url or fetch_result.final_url
+        if target:
+            rendered = render_fn(target)
+            if rendered:
+                r_title, r_meta, r_h1, r_body = extract_fields(rendered)
+                # Only adopt the render if it actually recovered more text.
+                if text_volume(r_title, r_meta, r_h1, r_body) > text_volume(title, meta_desc, h1, body):
+                    title, meta_desc, h1, body = r_title, r_meta, r_h1, r_body
+                    fetch_mode = "browser"
+
     full_lower = f"{title} {meta_desc} {h1} {body}".lower()
-
     if any(marker in full_lower for marker in _BLOCK_MARKERS):
-        return {"category": "error", "raw": None, "latency_ms": None, "model": None}
+        return {"category": "error", "raw": None, "latency_ms": None,
+                "model": None, "fetch_mode": fetch_mode}
 
     text = build_relevance_text(title, meta_desc, h1, body, max_body_chars=max_body_chars)
     result = classify_relevance(text, model=model)
@@ -508,4 +561,5 @@ def classify_page(
         "raw": result["raw"],
         "latency_ms": result["latency_ms"],
         "model": result["model"],
+        "fetch_mode": fetch_mode,
     }
