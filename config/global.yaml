@@ -6,11 +6,17 @@
 ollama:
   host: "http://localhost:11434"
 
-# Model tags. NOTE: as of scaffolding only qwen3-vl:8b is pulled locally;
-# pull 30b/32b before the Phase-4 three-model comparison.
+# Model tags. All three Qwen3-VL sizes (8b/30b/32b) plus a dedicated text
+# model (qwen3.6:27b) are pulled locally. navigation and detection_default
+# both run on the 30b MoE for accuracy at lower cost than the 32b dense
+# model; detection_pool is the separate 8b/30b/32b comparison set read by
+# 03_classify.py --model, untouched by this choice. relevance uses the text
+# model (not a VLM) since 01b_screen_relevance.py classifies extracted page
+# TEXT, no screenshot — see common/relevance.py and common/vlm.py:classify_relevance().
 models:
-  navigation: "qwen3-vl:8b"        # used live by 02_collect.py
-  detection_default: "qwen3-vl:8b" # 03_classify.py --model overrides this
+  navigation: "qwen3-vl:30b"        # used live by 02_collect.py
+  detection_default: "qwen3-vl:30b" # 03_classify.py --model overrides this
+  relevance: "qwen3.6:27b"          # 01b_screen_relevance.py's classify_relevance()
   detection_pool:                  # the three-model comparison set
     - "qwen3-vl:8b"
     - "qwen3-vl:30b"
@@ -48,3 +54,40 @@ browser:
 # IP rotation is a stub/hook only and is OFF. Do not implement rotation now.
 ip_rotation:
   enabled: false
+
+# Frame-relevance screening (01b_screen_relevance.py). Fetch is still plain
+# HTTP GET — no browser, no screenshots — but the JUDGMENT is now an LLM call
+# (common.vlm.classify_relevance(), frozen RELEVANCE_PROMPT in common/prompts.py),
+# not a keyword/pattern classifier. A deterministic keyword list structurally
+# can't tell a perfume site's "Tobacco Vanille" fragrance note from an actual
+# tobacco retailer, or recognize a JS-rendered storefront whose cart text only
+# exists inside a <script> template — both were real false positives/negatives
+# found in testing. --reclassify re-scores the already-stored gzipped HTML with
+# zero NETWORK calls, but still costs an LLM inference call per site (not free).
+# include_categories decides `included` in sites.
+#
+# NOTE: provenance is sites.relevance_model + sites.relevance_prompt_hash
+# (mirrors detections' model + detection_prompt_hash), not a ruleset-version
+# int — that concept was specific to the old deterministic classifier.
+relevance:
+  timeout_s: 10
+  max_response_bytes: 5000000       # 5 MB cap; stop reading past this
+  inter_request_delay_s: 1.0        # polite spacing between hosts, one GET each
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+  max_body_chars: 3000              # truncate extracted body text fed to the LLM
+  include_categories:
+    - "retailer"
+    - "brand_manufacturer"
+    - "marketplace"
+
+# Stratified probability sample drawn from RELEVANT sites (01c_draw_sample.py).
+# sample_u = sha256(frame_salt|site_id) is deterministic — changing frame_salt
+# invalidates and redraws the whole sample, so treat it as immutable once wave
+# 1 has been drawn. power/stratum_floor control the Bankier allocation across
+# the 9 ccTLD-derived regulatory strata (see common/sampling.py).
+sampling:
+  frame_salt: "agegate-2026-frame-v1"
+  target_n: 2500
+  power: 0.5
+  stratum_floor: 30
+  waves: 2

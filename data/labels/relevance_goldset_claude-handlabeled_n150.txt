@@ -1,0 +1,184 @@
+# Relevance gold set — HAND-LABELED BY CLAUDE (Opus), 2026-08-19
+#
+# PROVENANCE: labels in this file were assigned by Claude, NOT by the
+# pipeline's qwen3.6:27b relevance classifier. This file is the reference
+# set that classifier is scored AGAINST. It must never be produced or
+# overwritten by a model run.
+#
+# CAVEAT: Claude is itself an LLM, so this is LLM-assisted labeling, not
+# human ground truth. Spot-check a subset by hand and report agreement
+# before citing these as gold labels.
+#
+# LABEL: 1 = RELEVANT   (retailer | brand_manufacturer | marketplace)
+#        0 = IRRELEVANT (informational | unrelated | error/parked/blocked)
+#        Matches config/global.yaml relevance.include_categories, so a label
+#        here is directly comparable to the `included` column in sites.
+#
+# METHOD: each site fetched over plain HTTP; label assigned from extracted
+# title/meta/h1/body. Where that text was thin, empty or ambiguous, the page
+# was rendered in Playwright/Chromium and inspected VISUALLY — deliberately a
+# stronger signal than the HTML-only classifier gets, so the set is not blind
+# to JS-rendered storefronts. Those rows are marked [SCREENSHOT] in notes.
+#
+# SAMPLING: drawn from data/seed/nicotine-industry-sites.csv, deliberately
+# weighted for a relevant/irrelevant mix and multilingual coverage. NOT a
+# probability sample — report per-class precision/recall, not overall accuracy
+# as a frame-wide estimate.
+#
+# COUNTS: 150 sites | 51 relevant (1) | 99 irrelevant (0)
+# STRATA: {'gtld': 61, 'eu_west': 27, 'eu_east': 20, 'apac': 13, 'latam': 7, 'uk_ie': 6, 'mena_af': 6, 'na': 5, 'other': 5}
+# ccTLDs: 52 distinct
+#
+# FORMAT: <url><TAB><label><TAB><note>
+# Notes marked BORDERLINE are genuine judgment calls worth reviewing first.
+#
+http://3dvape.ru/	1	BORDERLINE retailer: RU shop selling vape coilbuilding supplies (coils/wire) alongside non-vape 3D-print goods
+http://bedavapornoindir.s29.info/	0	unrelated: phone unlocking service (GSM unlocking)
+http://cordovapedro.blogspot.com/	0	unrelated: personal blog
+http://enjoy-game-nopaying.blogspot.com/	0	unrelated: JP video-game walkthrough blog
+http://mofumofumewcat.blog.fc2.com/	0	unrelated: JP personal diary blog
+http://ouniversodedeborazynha.blogspot.com/	0	unrelated: empty personal blog
+http://przedszkole.ketrzyn.pl/	0	unrelated: domain-for-sale parking page
+http://smoketreepurple.blog.fc2.com/	0	unrelated: JP gardening blog ('smoketree' is a plant)
+http://vabulousandenjoy.blogspot.com/	0	unrelated: personal blog
+http://www.fumebarlounge.ca/	0	unrelated: bar/lounge venue serving shisha on-premises, no product sales funnel
+http://www.jaczynski.e-grajewo.pl/	0	unrelated: PL driving school
+http://www.parfumeriehouse.com/	0	unrelated: Thai perfume retailer
+http://www.perfumes.lv/	0	unrelated: LV perfume shop
+http://www.prolocosommarivaperno.it/	0	unrelated: IT local tourism association ('sommarivaPERNo' contains 'vaper')
+http://www.rene-perfumeria.pl/	0	unrelated: PL perfume/cosmetics shop
+http://www.smokinthisandthatbbq.com/	0	unrelated: BBQ restaurant in Kentucky
+http://www.vapormatra.es/	0	unrelated: ES HVAC company, pellet stoves/heat pumps ('vapor' substring)
+http://www.vapourmate.co.uk/	1	retailer: UK vape shop, e-liquids/disposables/nic salts
+http://znakomstvapeterburg.ru/	0	unrelated: RU dating site ('znakomstVAPEterburg' contains 'vape')
+https://11560940-the-chainsmokers-ft-daya.mp3.pm/	0	unrelated: mp3 download site (band name 'Chainsmokers')
+https://20spinjoys68.com/	0	unrelated: expired domain, registrar parking page
+https://adinahookah.de/	1	retailer: DE hookah/waterpipe shop (devices+accessories), borderline device-only
+https://alltomsnus.se/	0	informational: Swedish snus news/articles/reviews site, not a shop
+https://alshamsperfumes.ae/	0	unrelated: UAE perfume shop
+https://api.vapor.codes/	0	unrelated: Vapor Swift web-framework API documentation
+https://app.grimsmoknives.com/	0	unrelated: knife maker's buyers-choice app
+https://as-shisha.de/	1	retailer: German shisha/vape shop, cart+shipping+invoice checkout
+https://avapeter.ru/	0	unrelated: RU fertility clinic 'AVA-PETER' (host contains 'vape' by accident)
+https://basma-perfumes.com/	0	unrelated: AR perfume shop (thin JS page, title 'Basma for perfumes')
+https://beastvape.ca/	1	retailer: CA online vape shop, ejuice/pods/disposables
+https://blizyn.lento.pl/	0	unrelated: PL local classifieds listings
+https://bookmysmoke.com/	1	BORDERLINE retailer: IN hookah rental service w/ shisha flavour categories + cart
+https://brigantivaporfiok.it/	0	unrelated: IT animal-feed manufacturer ('vaporfiok')
+https://buycigarettes.in/	1	retailer: IN online cigarette wholesaler (Marlboro/Esse), cash on delivery
+https://caesar-vapes.com/	1	retailer: DE disposable vape shop, cart/checkout
+https://caktusvape.co.nz/	1	retailer: NZ vape store (nic salts, pods); own 18+ age gate visible
+https://carbolicsmokeblog.blogspot.com/	0	unrelated: satirical news blog
+https://centoriaperfume.com/	0	unrelated: FA perfume shop
+https://chefcigars.se/	1	retailer: SE cigar shop, cart+checkout
+https://chel.watsonvape.ru/	0	unrelated: vape domain now serving Aviasales flight-booking content
+https://cigarclub.md/	1	retailer: MD cigar shop, cigars+accessories with delivery
+https://cityvapedistro.eu/	1	retailer: EU vape distributor, e-liquids + disposables, brand catalogue
+https://cookandenjoyrecipes.wordpress.com/	0	unrelated: recipe/lifestyle blog
+https://creativejuice.studio/	0	unrelated: real-estate photography studio ('creativEJUICE' contains 'ejuice')
+https://dadavape.co.kr/	1	retailer: KR e-cig liquid shop, synthetic nicotine
+https://daddy-enjoy-life.tistory.com/	0	unrelated: KR parenting/childcare blog
+https://darlynsperfumeria.myshopify.com/	0	unrelated: perfume shop
+https://dinecigg.se/	1	retailer: DK/SE vape+e-cig+snus+nicotine pouch shop
+https://dlishperfumes.com/	0	unrelated: NZ perfume oil shop
+https://dolinanotecigravel.pl/	0	unrelated: PL gravel cycling event
+https://e6-vapeshop.de/	1	retailer: DE vape shop, liquids/aromas/e-cigarettes
+https://elperfumeguajiro.com/	0	unrelated: perfume retailer
+https://enjoy.loslagoshoteles.com/	0	unrelated: hotel booking site
+https://enjoyclover.com/	0	unrelated: adaptogenic herbal tea shop
+https://enjoyparty.qdm.tw/	0	unrelated: TW party balloon/decoration shop
+https://ep41evaperondonorione.blogspot.com/	0	unrelated: AR school class blog ('evaPERONdo' contains 'vaper')
+https://europerfumesoficial.mitiendanube.com/	0	unrelated: perfume store, suspended by platform
+https://evaporatorirotanti.it/	0	unrelated: IT lab/industrial rotary evaporators ('EVAPORAtori')
+https://filenjoywonlain007.blogspot.com/	0	unrelated: movie download blog
+https://generalsmokeshops.com/	1	retailer: US smoke shop, vape/tobacco/hemp/pipes/vaporizers
+https://ghostsmokeshopp.blogspot.com/	0	unrelated: 'claim your reward' offer-spam page, no shop
+https://gold1perfume.com/	0	unrelated: IL perfume shop
+https://groovapeoz.com/	1	retailer: AU vape shop, disposables + nicotine gum + e-juice, cart
+https://gubukvapebali.blogspot.com/	0	informational: ID vape mod review blog, no shop
+https://happy-parfumery.app.clloh.com/	0	unrelated: perfume/candle-making workshop courses
+https://hookah.tokyo/	1	retailer: JP shisha/waterpipe mail order (hookahs, shisha tobacco, accessories)
+https://hookah.zone/	0	unrelated: redirects to GoDaddy for-sale parking [SCREENSHOT]
+https://ibuffvape.com/	1	retailer: disposable vape shop (IBUFF 9600 puffs, 5% nic), cart [SCREENSHOT - HTML text showed only theme-demo sunglasses]
+https://jatostovapershop.es/	1	retailer: ES online vape shop, cart + free shipping over 30 EUR
+https://javaporcoadventure.com.br/	0	unrelated: BR outdoor adventure event ('javaPORCO' contains 'vapor')
+https://jonjoieperfume.com/	0	unrelated: perfume retailer
+https://jugcityvape.ca/	1	retailer: CA vape shop, disposables/pods/juice
+https://kainanshishakyo.com/	0	unrelated: JP municipal social welfare council ('shisha' substring)
+https://klerksdorp.planetofthevapes.co.za/	1	retailer: ZA vape shop branch, e-liquid/pods/disposables
+https://kumulusvape.loveminty.fr/	0	informational: coupon/customer-review aggregator page ABOUT a vape shop, not a shop
+https://labohookah.fr/	1	retailer: FR chicha/hookah shop, cart+checkout
+https://legal.blinkersvape.co/	0	unrelated: ID gambling portal (MUSANG178) squatting on a vape domain
+https://lezyny.edu.pl/	0	unrelated: PL primary school
+https://m.perfumetoc.co.kr/	0	unrelated: KR perfume wholesaler
+https://magnesiumbutincigarette.blogspot.com/	0	unrelated: TR personal philosophy blog
+https://misperfumesfavoritos.com/	0	unrelated: perfume shop
+https://mood-eliquid.co.uk/	0	unrelated: e-liquid domain now serving online-casino affiliate list [SCREENSHOT - JS-rendered]
+https://movetovape.co.nz/	0	unrelated: vape domain now serving online-casino affiliate content
+https://musthavetobacco.ru/	1	brand_manufacturer: RU shisha tobacco brand (MUSTHAVE Undercoal) w/ where-to-buy locator [SCREENSHOT - JS-rendered, 0 chars of HTML text]
+https://nl.nx-vapes.com/	1	brand_manufacturer: CN e-cigarette/disposable vape manufacturer & supplier
+https://novomoskovsk.fixvape.ru/	1	retailer: RU vape shop (in-store only), 18+ notice, 500+ e-liquids
+https://opusnusantara.id/	0	unrelated: Indonesian music education org (host contains 'snus' by accident)
+https://ossaperfumes.com/	0	unrelated: perfume retailer
+https://oswporazyn.poznan.lasy.gov.pl/	0	unrelated: PL State Forests regional site
+https://palmsvape.ca/	1	retailer: CA vape shop, own 19+ age gate + nicotine warning
+https://papillonperfumery.co.uk/	0	unrelated: UK artisan perfumery
+https://parfumeriaautopremium.com/	0	unrelated: RO CAR air-freshener perfumes incl. a 'Tobacco Vanilla' scent
+https://perfumes.com.pk/	0	unrelated: PK perfume-store directory
+https://perfumeshark.com/	0	unrelated: perfume shop
+https://perfumesheaven.com/	0	unrelated: AR perfume catalogue
+https://perfumessanluis.com/	0	unrelated: MX perfume shop
+https://perfumevisit.ir/	0	unrelated: IR perfume shop
+https://pichvapelog.wordpress.com/	0	informational: Thai personal blog logging vape products, no shop
+https://qamariyaperfume.nl/	0	unrelated: NL/Arabic perfume shop
+https://raksonperfumes.com/	0	unrelated: perfume retailer
+https://royalvape.cz/	1	retailer: CZ vape shop w/ prices, under-18 sale ban notice
+https://sabrinaperfumes25demarco.kyte.site/	0	unrelated: BR perfume/candle catalog storefront
+https://saunasvaporytinas.com.mx/	0	unrelated: MX sauna/steam-bath manufacturer ('vapor' substring)
+https://scentoraperfume.com/	0	unrelated: IN perfume shop
+https://seasmokewhalewatching.com/	0	unrelated: whale watching tours
+https://seguro.alvapersonalcare.com.br/	0	unrelated: BR personal care/cosmetics cart ('alVAPErsonalcare' contains 'vape')
+https://shishaonwheels.eu/	1	retailer: EU shisha delivery/catering + e-shop (flavours, charcoal, accessories)
+https://shishavibes.bg/	0	unrelated: BG hookah bar/lounge venue, no online product sales [SCREENSHOT]
+https://smilevape.co.kr/	1	retailer: KR e-cigarette e-liquid shop
+https://smokeandroast.com.au/	0	unrelated: AU general merchandise store (paint, swimwear), no nicotine
+https://smokeandvapescentre.co.uk/	1	retailer: UK online vape shop, large brand list, delivery
+https://smokeys.space/	0	unrelated: DE audiobook/radio-play store
+https://snusdaddy.es/	1	retailer: ES snus/nicotine-pouch shop (ZYN/VELO/Pablo), 18+ + nicotine warning
+https://social.joejuice.sa/	0	unrelated: Joe & The Juice cafe chain (KSA)
+https://souleperfume.com/	0	unrelated: perfume shop
+https://summerenjoy.blogspot.com/	0	unrelated: kosher summer activities blog
+https://swfttowing.com/	0	unrelated: Colorado towing company
+https://tatsuki-lab.doshisha.ac.jp/	0	unrelated: JP university research lab ('doSHISHAa' contains 'shisha')
+https://ushanovapermanent.ru/	0	unrelated: RU permanent makeup studio ('ushaNOVAPERmanent' contains 'vaper')
+https://vapeavenue.ru/	0	unrelated: RU repurposed domain, now a law/tech handbook site despite vape domain
+https://vapebang8.se/	1	retailer: SE vape seller (Vapekungen), disposables w/ prices+stock
+https://vapebuddy.ch/	1	BORDERLINE retailer: CH vape shop in maintenance mode but full shop nav (E-Zig/E-Liquids/DIY) visible
+https://vapeemtuacasa.pt/	1	retailer: PT disposable vape shop, catalogue + resale
+https://vapemart.co.in/	1	retailer: IN vape shop (elfbar/iget), cash-on-delivery checkout
+https://vapeo.club/	0	BORDERLINE informational: ES DIY e-liquid mixing community/recipes+calculator, own 18+ gate, no cart
+https://vapepie.rip/	1	retailer: AU VAPEPIE official store, own 21+ age verification
+https://vapepie.xyz/	0	unrelated: redirects to GoDaddy for-sale parking [SCREENSHOT]
+https://vaperbar.ru/	0	unrelated: vape domain now serving Aviasales flight-booking content
+https://vapes.se/	1	retailer: Swedish vape shop, e-cigs + nicotine e-juice
+https://vapesclub.mx/	0	unrelated: cPanel server-error page, site not serving [SCREENSHOT]
+https://vapeukcbd.co.uk/	1	retailer: UK vape shop, kits/e-liquids/nicotine salts
+https://vaporhub.ae/	1	retailer: UAE vape shop, disposables + 3h Dubai delivery
+https://victory-perfumes.com/	0	unrelated: perfume brand shop
+https://www.ayaamperfumes.com/	0	unrelated: AR perfume brand shop
+https://www.bluetreejuice.com/	0	unrelated: Hawaii cafe/juice bar
+https://www.buysnus.at/	1	retailer: AT snus/nicotine-pouch shop, bulk pricing
+https://www.calaveravapors.com.ar/	1	retailer: AR vape shop, pods/e-liquids/nicotine salts
+https://www.caravanadecigana.com.br/	0	unrelated: BR tarot/cartomancy course ('deCIGana' contains 'ecig')
+https://www.dnaperfumes.com/	0	unrelated: BR perfume-making supplies shop
+https://www.enjoyahome.es/	0	unrelated: Tenerife villa rental/property management
+https://www.enjoymusic.agency/	0	unrelated: suspended website placeholder
+https://www.gute-liquids.de/	1	retailer: DE e-liquid/vape shop (Steamer-Store), cart+checkout
+https://www.lavapeshop.ca/	1	retailer: CA vape shop franchise, 35+ locations, cart
+https://www.namastevapes.nl/	1	BORDERLINE retailer: dry-herb vaporizer shop (Herbalize) - vape hardware, not nicotine per se
+https://www.premiumvapeteam.com/	1	retailer: US vape shop, e-liquid/disposables/wholesale
+https://www.rainbowvapes.co.uk/	1	retailer: UK e-liquid/nic salts shop
+https://www.sutravape.mx/	1	retailer: vaporizer/510-battery wholesaler, own 21+ age verification
+https://www.thevipsmokeshop.com/	1	retailer: US smoke shop chain, cigars/hookahs/disposables
+https://www.vapeowave.co.za/	1	retailer: ZA vape shop, mods/tanks/disposables
+https://xsnus.se/	1	retailer: SE snus & vape shop (VELO/FIX/IQOS), cart

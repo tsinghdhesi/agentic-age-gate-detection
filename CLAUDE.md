@@ -24,9 +24,12 @@ Runs **fully locally**: Qwen3-VL via **Ollama at http://localhost:11434**.
 5. **Screenshots are the source of truth.** Every checkpoint persists PNG(s).
    Detection is a separate downstream pass over those PNGs. `02_collect.py`
    MUST NOT write age-gate labels.
-6. **The detection prompt is a frozen instrument.** Stored in ONE place, hashed,
-   hash recorded per run (`runs.detection_prompt_hash`). Never edited inline.
-   (The prompt module itself lands in Phase 2.)
+6. **The detection prompt AND the relevance prompt are frozen instruments.**
+   Stored in ONE place (`common/prompts.py`), hashed, hash recorded per row
+   downstream (`runs.detection_prompt_hash` / `sites.relevance_prompt_hash`).
+   Never edited inline. `RELEVANCE_PROMPT` determines the **sampling frame**
+   itself — at least as consequential for external validity as the detection
+   prompt — and gets the same treatment, not a lighter one.
 
 ## CRITICAL — Qwen3-VL coordinates
 Qwen3-VL emits coords on a normalized **1000×1000 canvas** (NOT pixels, NOT
@@ -40,11 +43,31 @@ loop. Never re-derive the math inline.
 - **site_id = `<hostslug>_<6char url hash>`** (e.g. `m_hindi_vampedvape_com_3f9a1c`).
   Stable across resumes, debuggable on disk, collision-safe per distinct URL.
   Also the screenshot/dom folder name.
-- **Queue carries inclusion columns.** `01_build_queue` ingests ALL seed URLs
-  (normalize + dedupe, full provenance). A *separate later pass* sets
-  `included` / `relevance_label` / `sample_stratum`. Crawler reads only
-  `included = 1`. (Reason: the seed is 133,981 noisy CrUX URLs — far more than a
-  serial crawl can cover.)
+- **Frame construction is a 3-script pipeline, in this order:**
+  `01_build_queue.py` (ingest ALL seed URLs, normalize + dedupe via
+  `common/urls.py`, assign `sample_stratum` immediately — it's a pure
+  function of `cctld` via `common/sampling.py:stratum_for_cctld`, no reason
+  to defer it) → `01b_screen_relevance.py` (fetch is plain HTTP GET — no
+  browser, no screenshots, still ~10x cheaper than a Playwright+VLM screen —
+  but the JUDGMENT is an **LLM call**, `common.vlm.classify_relevance()`
+  against the frozen `RELEVANCE_PROMPT`, model = `qwen3.6:27b`. NOT a
+  keyword/pattern classifier — a deterministic term list structurally can't
+  tell a perfume site's "Tobacco Vanille" fragrance note from an actual
+  tobacco retailer, which is exactly the false-positive class that motivated
+  switching. Still cheap enough to screen the WHOLE frame instead of a
+  sample; a block/bot-check page still short-circuits to `"error"`
+  deterministically with no LLM call, since recognizing a Cloudflare
+  interstitial is mechanical, not a judgment call) → `01c_draw_sample.py`
+  (stratified probability sample drawn from `included = 1` sites only —
+  **sampling happens AFTER relevance screening**, so the funnel-crawl budget
+  is spent on confirmed retailers, not raw CrUX noise). Crawler
+  (`02_collect.py`) reads only `included = 1 AND sample_wave IS NOT NULL`.
+  Note: `01b` writing `relevance_label` does **not** relax invariant 5 —
+  that invariant is about *age-gate* labels and `02_collect.py` specifically;
+  relevance is a frame-construction concern, in its own table-adjacent
+  columns, produced before any crawling starts. `common/relevance.py` still
+  contains the ORIGINAL deterministic `classify_html()` — kept for
+  reference/fast local iteration, not called by the production script.
 - **`cctld` stores the EXACT public suffix**, never null — `com`, `org`,
   `co.uk`, `com.br`, `ru`, etc. (user directive). Extraction in `01_build_queue`
   will use **tldextract configured OFFLINE** (bundled PSL snapshot, no network)
@@ -57,10 +80,23 @@ loop. Never re-derive the math inline.
   checkpoint, so `detection_capture` (in `global.yaml`) is a re-classification
   toggle, never a re-crawl. `navigation_capture` is fixed at viewport.
 
-## Data model (SQLite, [common/db.py](common/db.py))
+## Data model (SQLite, [common/db.py](common/db.py), SCHEMA_VERSION 3)
 Collection facts and classification labels are split on purpose — do not merge.
 - `runs` — run_id, started/finished, config_hash, detection_prompt_hash, ...
-- `sites` — crawl queue (see locked decisions). `included`-gated.
+- `sites` — crawl queue (see locked decisions). `included`-gated. v2 added
+  `relevance_score`/`relevance_ts`/`http_status` (written by
+  `01b_screen_relevance.py` via `db.set_site_relevance()`) and
+  `sample_u`/`sample_wave` (written by `01c_draw_sample.py`, write-once via
+  `db.set_site_sample_u()`/`db.mark_sites_drawn()`). v3 replaced
+  `relevance_ruleset` (INTEGER — a deterministic-classifier concept) with
+  `relevance_model`/`relevance_prompt_hash` TEXT, mirroring `detections`'
+  `model`/`detection_prompt_hash` provenance now that 01b's judgment is an
+  LLM call, not a keyword ruleset. `upsert_site()` is the FRAME writer only
+  (site_id, host, cctld, ...) — it never touches these relevance/sampling
+  columns directly, so a re-run of `01_build_queue` structurally cannot wipe
+  a relevance screen or a sample draw. `init_db()` raises
+  `SchemaVersionMismatch` rather than silently re-stamping an old DB — a
+  version bump means new columns the code depends on.
 - `observations` — one row per (run, site, checkpoint). Paths, nav_method,
   nav_steps, failure_reason. **NO age-gate label.**
 - `detections` — filled by 03. One row per (run, site, checkpoint, **model**) →
@@ -79,15 +115,26 @@ stage — NOT a failure), `timeout`/`error`. Block-page detection is its own pas
 ## Repo layout
 `common/` shared lib (imported, never run) · `config/` global + per-industry YAML
 · `scripts/` 01–05 standalone resumable steps · `spike/` Day-1 validation ·
-`label_ui/` manual review · `data/` seed (tracked) + screenshots/dom/logs/sqlite
-(gitignored). Seed: `data/seed/nicotine-industry-sites.csv` — single column, NO
-header, CRLF, ~115k https / 19k http, 0 exact-dup lines, 133,981 rows.
+`label_ui/` manual review · `data/` seed (tracked) + screenshots/dom/logs/html/sqlite
+(gitignored, except seed). `data/html/<site_id>.html.gz` is `01b_screen_relevance.py`'s
+stored fetch — the source of truth for that step, so `--reclassify` re-scores
+it with zero network calls. Seed: `data/seed/nicotine-industry-sites.csv` —
+single column, NO header, CRLF, 114,714 https / 19,268 http, 0 exact-dup lines,
+**133,982 rows** (file has no trailing newline — a naive `split('\n')` silently
+drops the last row; stream with `for line in f` instead). After www/port
+canonicalization the distinct-site frame is **115,792 rows** (13.6% collapse) —
+verified by `01_build_queue.py`, which also assigns each row to one of 9
+ccTLD-derived `sample_stratum` buckets (`common/sampling.py`): gtld 65.5%,
+eu_east 12.7%, eu_west 7.9%, apac 4.8%, latam 3.2%, uk_ie 2.5%, mena_af 1.4%,
+other 1.0%, na 0.9%.
 
 ## Environment
 - Mac M5 Pro, 48GB, macOS. Python 3.12 in `./.venv` (repo root).
-- Ollama running with **all three models pulled**: `qwen3-vl:8b` (6.1 GB, dev),
-  `qwen3-vl:30b` (19.6 GB), `qwen3-vl:32b` (20.9 GB) — all Q4_K_M, vision-capable.
-- Playwright Chromium not yet installed (`playwright install chromium`, Phase 2).
+- Ollama running with **four models pulled**: `qwen3-vl:8b` (6.1 GB, dev),
+  `qwen3-vl:30b` (19.6 GB), `qwen3-vl:32b` (20.9 GB) — Q4_K_M, vision-capable —
+  plus `qwen3.6:27b` (17.4 GB), a dedicated TEXT model (no vision) used only
+  by `classify_relevance()` for frame-relevance screening.
+- Playwright Chromium installed.
 
 ## Ollama / Qwen3-VL gotchas (verified)
 - **Disable thinking** (`think=False`) on every call, else output is polluted
@@ -96,25 +143,73 @@ header, CRLF, ~115k https / 19k http, 0 exact-dup lines, 133,981 rows.
   and leave `response` empty** on this build (and it's the *fast* path, ~32 eval
   tokens). `vlm._resp_text()` prefers `response`, falls back to `thinking` —
   do not "simplify" that away. Navigation uses `format=NAV_FORMAT`.
-- Detection prompt hash (PROVISIONAL — spike phase, prompt still being iterated;
-  edit freely, no rehash/lineage bookkeeping until it freezes at first real
-  scrape): `6c1d2445c940a95cfb7cdccb53160f28ae57690f89854eda38df7a0c61ceb8c8`.
+- **Detection prompt hash — FROZEN** (2026-06-28, model = `qwen3-vl:30b`):
+  `eab9754285c7e790cfbd97aa3c8b916434a4feaf31df7f7c7ea6896039ae987a`.
+  Validated on `spike/spike_detection.py`'s n=23 hand-verified set: 23/23
+  correct (TP=9 FP=0 TN=14 FN=0) on both full_page and viewport captures.
+  Specifically tests the language-agnostic clause: 6 non-English age gates
+  (bg/pt-BR/pl/fr/nl/it), all correctly detected — including two where the
+  real gate was partially obscured by a stacked cookie-consent banner, and
+  the model correctly saw past the banner without miscounting it as a gate.
+  Also validates the exclusion boundary: bot "not a robot" checks, Cloudflare
+  block/verification pages, and a maintenance page were all correctly NOT
+  flagged. Per invariant #6, any further wording change is a new instrument —
+  edit `DETECTION_PROMPT` deliberately and treat results under the new hash
+  as a separate measure.
 - Validated live: blank→0, synthetic gate→1; nav click on a YES button rescaled
   to within ~2px of its true center via `coords`.
+- **Relevance prompt hash — FROZEN** (model = `qwen3.6:27b`):
+  `ffd9b7b74020e958614ddcc6c4485e2986e28adffdec16fb995f9d0f1233c2f8`.
+  Validated on `spike/spike_relevance.py`'s hand-verified set: 13/13 correct
+  on genuine judgment calls (2 apparent mismatches were non-classifier
+  artifacts — a JS-rendered storefront whose real content never reaches a
+  no-browser fetch, and a same-session repeated-request rate limit — not
+  prompt/model errors). Two real fixes came out of live testing before
+  freezing: (1) an explicit instruction that a nicotine-adjacent WORD in a
+  product/brand name (e.g. a perfume's "Tobacco Vanille" fragrance note) is
+  not evidence of a nicotine retailer — judge actual business, not word
+  matches; (2) an explicit instruction that "under construction"/"coming
+  soon"/parked-domain placeholders classify as `unrelated` regardless of
+  what the domain name implies, since the model was initially over-weighting
+  the domain/title over the page's actual (empty) content.
+- `classify_relevance()` is a TEXT-only call — no `images=` kwarg, unlike
+  `detect_age_gate()`/`decide_navigation()`. `_parse_relevance()` and
+  `_parse_nav()` both had a latent crash bug: `json.loads()` succeeds on any
+  valid JSON scalar (`null`, a bare string/number, a list), and calling
+  `.get()` on a non-dict result raised an unhandled `AttributeError` instead
+  of degrading gracefully. Both now check `isinstance(obj, dict)` before
+  calling `.get()` — a single malformed model response must never crash a
+  multi-day screen or a live navigation loop.
 
 ## How to run (so far)
 - Tests: `./.venv/bin/python -m pytest -q`
 - Init DB: `./.venv/bin/python -c "from common import db; c=db.connect(); db.init_db(c)"`
 - Grounding spike: `./.venv/bin/python spike/spike_grounding.py` (`--mode som` for Set-of-Mark)
 - Detection spike: `./.venv/bin/python spike/spike_detection.py`
+- Relevance spike: `./.venv/bin/python spike/spike_relevance.py`
+- Build queue: `./.venv/bin/python scripts/01_build_queue.py`
+- Screen relevance: `./.venv/bin/python scripts/01b_screen_relevance.py --limit N`
+- Draw sample: `./.venv/bin/python scripts/01c_draw_sample.py --dry-run` (review before a real draw)
 
 ## Build status (pause for OK between phases)
 - [x] **Phase 1 — Scaffold:** tree, requirements, .gitignore, coords + test,
-  config loader + YAMLs, SQLite schema, this file. ← awaiting review
+  config loader + YAMLs, SQLite schema, this file.
 - [x] **Phase 2 — spikes + `vlm.py`/`screenshot.py`/`stealth.py` + frozen
-  `prompts.py`.** Compiles; VLM path validated live. ← awaiting your spike run
+  `prompts.py`.** Detection prompt FROZEN (n=23, 6 languages, see gotchas below).
+- [x] **Frame construction (standalone, run before Phase 3 — not itself a
+  phase):** `01_build_queue.py` → `01b_screen_relevance.py` → `01c_draw_sample.py`.
+  All three built, tested (`common/urls.py`, `common/sampling.py`,
+  `common/relevance.py`, schema v3), and verified live end-to-end against the
+  real seed (frame = 115,792 sites, 0 rejects, idempotency proven against a
+  live DB, `--reclassify` and `--retry-failed` both verified). Models switched
+  to `qwen3-vl:30b` for both navigation and detection. `01b` initially used a
+  deterministic keyword classifier (schema v2); switched to an LLM judgment
+  (`qwen3.6:27b`, frozen `RELEVANCE_PROMPT`, schema v3) after live testing
+  found real false positives/negatives a keyword list can't fix — see the
+  Ollama gotchas below. Real observed throughput: ~3.2s/site (LLM-call-bound,
+  not fetch-bound), so a full-frame screen is now estimated at ~4-5 days
+  serial rather than 1-2 — this has NOT yet been run at full scale, only in
+  small live batches (largest: 40 sites).
 - [ ] Phase 3 — `02_collect.py` (nav loop, resumability, failure class, logging)
 - [ ] Phase 4 — `03_classify.py` + `04_classify_blocks.py`
 - [ ] Phase 5 — `05_analyze.py` + `label_ui/`
-- `01_build_queue.py` (ingest seed → `sites`, offline-tldextract cctld) is a
-  **standalone step run before `02_collect`** — not folded into a phase.

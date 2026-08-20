@@ -22,7 +22,13 @@ from typing import Iterator, Optional
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = REPO_ROOT / "data" / "agegate.sqlite"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3  # v3: sites.relevance_ruleset (INTEGER, a deterministic-
+                    # classifier concept) replaced by relevance_model +
+                    # relevance_prompt_hash — mirrors detections' model +
+                    # detection_prompt_hash now that 01b's judgment is an LLM
+                    # call (RELEVANCE_PROMPT), not a keyword ruleset. v2 added
+                    # relevance_score/relevance_ts/http_status/sample_u/
+                    # sample_wave — see 01b/01c.
 
 # Allowed enums (documented here; enforced by callers, kept as TEXT in SQLite).
 FAILURE_REASONS = ("blocked_bot", "nav_stuck", "no_such_stage", "timeout", "error")
@@ -66,11 +72,23 @@ CREATE TABLE IF NOT EXISTS runs (
     notes                 TEXT
 );
 
--- Crawl queue. Ingests ALL seed URLs (full provenance); a later pass populates
--- inclusion/sampling. cctld stores the EXACT public suffix (e.g. com, org,
--- co.uk, com.br, ru) and is NEVER null for a parseable host.
+-- Crawl queue. 01_build_queue.py ingests ALL seed URLs (normalize + dedupe,
+-- full provenance) AND assigns sample_stratum immediately — it is a pure
+-- function of cctld (common.sampling.stratum_for_cctld), not something that
+-- needs a separate pass. cctld stores the EXACT public suffix (e.g. com,
+-- org, co.uk, com.br, ru) and is NEVER null for a parseable host.
+--
+-- included/relevance_label/relevance_score/relevance_model/relevance_prompt_hash/
+-- relevance_ts/http_status are set by 01b_screen_relevance.py. The fetch
+-- (common.relevance.fetch()) is still plain HTTP GET, no browser — but the
+-- JUDGMENT is an LLM call (common.vlm.classify_relevance(), frozen
+-- RELEVANCE_PROMPT), not a keyword ruleset, over the WHOLE frame.
+-- sample_u/sample_wave are set by 01c_draw_sample.py, which draws a
+-- stratified probability sample from the sites 01b confirmed relevant —
+-- sampling happens AFTER relevance screening, not before, so the funnel
+-- crawl budget is spent on confirmed retailers rather than raw seed noise.
 CREATE TABLE IF NOT EXISTS sites (
-    site_id            TEXT PRIMARY KEY,          -- hostslug_<6char url hash>
+    site_id            TEXT PRIMARY KEY,          -- hostslug_<6char url_key hash>
     url_original       TEXT NOT NULL,
     url_normalized     TEXT NOT NULL,
     host               TEXT,
@@ -80,8 +98,15 @@ CREATE TABLE IF NOT EXISTS sites (
     source_file        TEXT,
     added_ts           TEXT,
     included           INTEGER NOT NULL DEFAULT 0,-- crawler reads only included=1
-    relevance_label    TEXT,                      -- NULL until classified
-    sample_stratum     TEXT,
+    relevance_label    TEXT,                      -- NULL until 01b classifies it
+    sample_stratum     TEXT,                      -- ccTLD-derived region, set at ingest
+    relevance_score      REAL,                    -- classify_html() score IF that legacy path is ever used
+    relevance_model      TEXT,                    -- which Ollama model produced this label
+    relevance_prompt_hash TEXT,                   -- which frozen RELEVANCE_PROMPT produced this
+    relevance_ts        TEXT,
+    http_status          INTEGER,                 -- from the relevance-screen fetch
+    sample_u             REAL,                    -- deterministic draw variate; write-once
+    sample_wave          INTEGER,                 -- NULL = undrawn; else which wave drew it
     UNIQUE (url_normalized)
 );
 
@@ -154,6 +179,8 @@ CREATE TABLE IF NOT EXISTS site_outcomes (
 CREATE INDEX IF NOT EXISTS idx_sites_included      ON sites(included);
 CREATE INDEX IF NOT EXISTS idx_sites_industry      ON sites(industry);
 CREATE INDEX IF NOT EXISTS idx_sites_cctld         ON sites(cctld);
+CREATE INDEX IF NOT EXISTS idx_sites_sample        ON sites(sample_stratum, sample_u);
+CREATE INDEX IF NOT EXISTS idx_sites_wave          ON sites(sample_wave);
 CREATE INDEX IF NOT EXISTS idx_obs_run             ON observations(run_id);
 CREATE INDEX IF NOT EXISTS idx_obs_failure         ON observations(failure_reason);
 CREATE INDEX IF NOT EXISTS idx_det_model           ON detections(model);
@@ -162,8 +189,26 @@ CREATE INDEX IF NOT EXISTS idx_outcome_status      ON site_outcomes(terminal_sta
 """
 
 
+class SchemaVersionMismatch(RuntimeError):
+    """Raised when an existing DB's user_version doesn't match SCHEMA_VERSION.
+    init_db() must never silently re-stamp an incompatible database — a
+    version bump adds columns the running code depends on, and a mismatch
+    here usually means an old DB file needs a real migration, not a stamp.
+    """
+
+
 def init_db(conn: sqlite3.Connection) -> None:
-    """Create all tables + indexes (idempotent) and stamp the schema version."""
+    """Create all tables + indexes (idempotent) and stamp the schema version.
+    Raises SchemaVersionMismatch if the DB already exists with a DIFFERENT,
+    non-zero user_version — refuses to silently paper over a stale schema.
+    """
+    existing = conn.execute("PRAGMA user_version;").fetchone()[0]
+    if existing not in (0, SCHEMA_VERSION):
+        raise SchemaVersionMismatch(
+            f"DB user_version={existing} does not match SCHEMA_VERSION="
+            f"{SCHEMA_VERSION}. This DB predates a schema change — inspect it "
+            "and migrate deliberately rather than re-stamping."
+        )
     conn.executescript(_SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
     conn.commit()
@@ -216,16 +261,37 @@ def upsert_site(
     cctld: Optional[str],
     industry: str,
     source_file: Optional[str] = None,
-    included: int = 0,
+    included: Optional[int] = None,
     relevance_label: Optional[str] = None,
     sample_stratum: Optional[str] = None,
 ) -> None:
+    """The FRAME writer — called by 01_build_queue.py only. `included` and
+    `relevance_label` are set by 01b_screen_relevance.py's narrower
+    set_site_relevance() in normal operation; they're accepted here too
+    (COALESCE-protected) for flexibility, but a plain re-ingest that omits
+    them (leaves them None) must NEVER wipe out prior relevance-screening
+    work — that was a real bug: the original unconditional `excluded.*`
+    overwrite meant re-running 01_build_queue after a multi-hour screen
+    reset every site back to included=0. sample_stratum stays a plain
+    overwrite: it's a pure function of cctld computed fresh at every ingest,
+    so recomputing it is correct, not destructive (e.g. if the ccTLD->region
+    map in common.sampling is later refined). Does NOT commit — callers
+    batch-commit across many rows.
+    """
+    # `included` is NOT NULL DEFAULT 0 in the schema, but DEFAULT only kicks
+    # in when a column is OMITTED from the INSERT, not when it's explicitly
+    # bound to NULL — which is what happens on first-insert whenever the
+    # caller leaves included=None. COALESCE(?, 0) in the VALUES clause
+    # covers first-insert; the raw `?` bound again in the SET clause (NOT
+    # excluded.included, which would already have been defaulted to 0 by
+    # that same VALUES-clause COALESCE) is what lets a None on re-ingest
+    # correctly fall through to preserving sites.included.
     conn.execute(
         """
         INSERT INTO sites (site_id, url_original, url_normalized, host,
                            registrable_domain, cctld, industry, source_file,
                            added_ts, included, relevance_label, sample_stratum)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 0), ?, ?)
         ON CONFLICT(site_id) DO UPDATE SET
             url_original       = excluded.url_original,
             url_normalized     = excluded.url_normalized,
@@ -234,12 +300,13 @@ def upsert_site(
             cctld              = excluded.cctld,
             industry           = excluded.industry,
             source_file        = excluded.source_file,
-            included           = excluded.included,
-            relevance_label    = excluded.relevance_label,
+            included           = COALESCE(?, sites.included),
+            relevance_label    = COALESCE(excluded.relevance_label, sites.relevance_label),
             sample_stratum     = excluded.sample_stratum
         """,
         (site_id, url_original, url_normalized, host, registrable_domain, cctld,
-         industry, source_file, now_iso(), included, relevance_label, sample_stratum),
+         industry, source_file, now_iso(), included, relevance_label, sample_stratum,
+         included),
     )
 
 
@@ -248,17 +315,178 @@ def get_site(conn: sqlite3.Connection, site_id: str) -> Optional[sqlite3.Row]:
     return cur.fetchone()
 
 
+_ORDER_BY_COLUMNS = {"site_id": "site_id", "sample_u": "sample_u"}
+
+
 def iter_included_sites(
-    conn: sqlite3.Connection, industry: Optional[str] = None
+    conn: sqlite3.Connection,
+    industry: Optional[str] = None,
+    *,
+    order_by: str = "site_id",
 ) -> Iterator[sqlite3.Row]:
-    """Crawl queue: sites flagged included=1, optionally filtered by industry."""
+    """Crawl queue: sites flagged included=1, optionally filtered by industry.
+    order_by="sample_u" is what 02_collect.py should use: since sample_u is
+    the deterministic draw variate, iterating in that order means ANY
+    truncation of the funnel crawl (it's the slowest, most likely-to-be-cut-
+    short step) is itself still a valid stratified sample of what it covered.
+    """
+    if order_by not in _ORDER_BY_COLUMNS:
+        raise ValueError(f"order_by must be one of {sorted(_ORDER_BY_COLUMNS)}, got {order_by!r}")
+    column = _ORDER_BY_COLUMNS[order_by]
     if industry is None:
-        cur = conn.execute("SELECT * FROM sites WHERE included = 1 ORDER BY site_id")
+        cur = conn.execute(f"SELECT * FROM sites WHERE included = 1 ORDER BY {column}")
     else:
         cur = conn.execute(
-            "SELECT * FROM sites WHERE included = 1 AND industry = ? ORDER BY site_id",
+            f"SELECT * FROM sites WHERE included = 1 AND industry = ? ORDER BY {column}",
             (industry,),
         )
+    yield from cur
+
+
+# --------------------------------------------------------------------------- #
+# sites — relevance screening (01b_screen_relevance.py, common.relevance)
+# --------------------------------------------------------------------------- #
+def set_site_relevance(
+    conn: sqlite3.Connection,
+    site_id: str,
+    *,
+    relevance_label: str,
+    included: int,
+    relevance_score: Optional[float] = None,
+    relevance_model: Optional[str] = None,
+    relevance_prompt_hash: Optional[str] = None,
+    http_status: Optional[int] = None,
+) -> None:
+    """The narrow writer for 01b_screen_relevance.py — keeps relevance
+    concerns out of upsert_site's frame-writing responsibility. Commits.
+    """
+    conn.execute(
+        """
+        UPDATE sites SET
+            relevance_label        = ?,
+            included               = ?,
+            relevance_score        = ?,
+            relevance_model        = ?,
+            relevance_prompt_hash  = ?,
+            relevance_ts           = ?,
+            http_status            = ?
+        WHERE site_id = ?
+        """,
+        (relevance_label, included, relevance_score, relevance_model,
+         relevance_prompt_hash, now_iso(), http_status, site_id),
+    )
+    conn.commit()
+
+
+def iter_pending_relevance(
+    conn: sqlite3.Connection,
+    *,
+    prompt_hash: str,
+    industry: Optional[str] = None,
+    retry_failed: bool = False,
+) -> Iterator[sqlite3.Row]:
+    """Work queue for 01b: frame rows not yet classified under the CURRENT
+    RELEVANCE_PROMPT. No cursor file needed — resumability comes from the
+    data itself (relevance_prompt_hash lags the live prompt's hash, e.g.
+    after a deliberate prompt revision — see common.prompts.RELEVANCE_PROMPT_HASH).
+    retry_failed also re-queues rows whose previous attempt was
+    unreachable/blocked/error, up to config relevance.max_attempts (enforced
+    by the caller, not here).
+    """
+    clauses = ["(relevance_prompt_hash IS NULL OR relevance_prompt_hash != ?)"]
+    params: list = [prompt_hash]
+    if retry_failed:
+        clauses[-1] = (
+            "(relevance_prompt_hash IS NULL OR relevance_prompt_hash != ? "
+            "OR relevance_label IN ('unreachable', 'blocked', 'error'))"
+        )
+    if industry is not None:
+        clauses.append("industry = ?")
+        params.append(industry)
+    where = " AND ".join(clauses)
+    cur = conn.execute(
+        f"SELECT * FROM sites WHERE {where} ORDER BY sample_stratum, site_id", params
+    )
+    yield from cur
+
+
+# --------------------------------------------------------------------------- #
+# sites — stratified sample draw (01c_draw_sample.py, common.sampling)
+# --------------------------------------------------------------------------- #
+def set_site_sample_u(conn: sqlite3.Connection, rows: list[tuple[str, float]]) -> None:
+    """Write-once: only fills sample_u where it is currently NULL, so a
+    re-run never perturbs a variate that a prior wave's draw already
+    depended on. rows = [(site_id, u), ...]. Commits.
+    """
+    conn.executemany(
+        "UPDATE sites SET sample_u = COALESCE(sample_u, ?) WHERE site_id = ?",
+        [(u, site_id) for site_id, u in rows],
+    )
+    conn.commit()
+
+
+def mark_sites_drawn(conn: sqlite3.Connection, site_ids: list[str], wave: int) -> None:
+    """Write-once: only fills sample_wave where it is currently NULL — a
+    site already drawn in an earlier wave keeps that wave number. Commits.
+    """
+    conn.executemany(
+        "UPDATE sites SET sample_wave = COALESCE(sample_wave, ?) WHERE site_id = ?",
+        [(wave, site_id) for site_id in site_ids],
+    )
+    conn.commit()
+
+
+def frame_counts_by_stratum(
+    conn: sqlite3.Connection,
+    industry: Optional[str] = None,
+    *,
+    included_only: bool = False,
+    undrawn_only: bool = False,
+) -> dict[str, int]:
+    """N_h per stratum for common.sampling.allocate(). included_only=True
+    restricts to sites 01b confirmed relevant (included=1) — this is the
+    population 01c actually samples from, per the finalized pipeline order
+    (relevance screening happens over the WHOLE frame before sampling).
+    """
+    clauses = []
+    params: list = []
+    if industry is not None:
+        clauses.append("industry = ?")
+        params.append(industry)
+    if included_only:
+        clauses.append("included = 1")
+    if undrawn_only:
+        clauses.append("sample_wave IS NULL")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    cur = conn.execute(
+        f"SELECT sample_stratum, COUNT(*) AS n FROM sites {where} GROUP BY sample_stratum",
+        params,
+    )
+    return {row["sample_stratum"]: row["n"] for row in cur}
+
+
+def iter_undrawn_relevant_sites(
+    conn: sqlite3.Connection,
+    industry: Optional[str] = None,
+) -> Iterator[sqlite3.Row]:
+    """Population 01c draws from: relevant (included=1), not yet assigned to
+    any wave, ordered by (stratum, sample_u) so per-stratum lowest-u
+    selection is a simple LIMIT/groupby slice.
+
+    sample_u IS NOT NULL is defensive, not redundant: SQLite sorts NULL
+    FIRST in ASC order, so a row 01c's backfill step hasn't reached yet
+    (e.g. 01b_screen_relevance.py still writing concurrently) would
+    otherwise be wrongly prioritized ahead of every real low-u candidate.
+    """
+    clauses = ["included = 1", "sample_wave IS NULL", "sample_u IS NOT NULL"]
+    params: list = []
+    if industry is not None:
+        clauses.append("industry = ?")
+        params.append(industry)
+    cur = conn.execute(
+        f"SELECT * FROM sites WHERE {' AND '.join(clauses)} ORDER BY sample_stratum, sample_u",
+        params,
+    )
     yield from cur
 
 

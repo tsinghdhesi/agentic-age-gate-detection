@@ -1,14 +1,19 @@
 """Local Ollama client — the ONLY inference surface. No cloud, ever.
 
-Two calls to the same Qwen3-VL model:
-  * detect_age_gate()    — frozen prompt, returns a binarized 1/0 plus the raw
-                           output. Used by 03_classify.py.
-  * decide_navigation()  — viewport screenshot + checkpoint goal, returns a
-                           structured action on the 1000x1000 canvas. Used live
-                           by 02_collect.py.
+Three calls:
+  * detect_age_gate()     — Qwen3-VL, frozen prompt + screenshot, returns a
+                            binarized 1/0 plus the raw output. Used by
+                            03_classify.py.
+  * decide_navigation()   — Qwen3-VL, viewport screenshot + checkpoint goal,
+                            returns a structured action on the 1000x1000
+                            canvas. Used live by 02_collect.py.
+  * classify_relevance()  — a TEXT model (no image), frozen prompt + a
+                            page's extracted text, returns a structured
+                            category. Used by 01b_screen_relevance.py to
+                            build the sampling frame.
 
-Qwen3-VL has a "thinking" mode; we disable it (think=False) so detection returns
-a bare character and navigation returns bare JSON, not chain-of-thought.
+Both Qwen3-VL and the text model support a "thinking" mode; we disable it
+(think=False) everywhere so responses are bare output, not chain-of-thought.
 """
 
 from __future__ import annotations
@@ -21,7 +26,13 @@ from typing import Any, Dict, Optional, Union
 import ollama
 
 from common import config
-from common.prompts import DETECTION_PROMPT, NAV_FORMAT, navigation_prompt
+from common.prompts import (
+    DETECTION_PROMPT,
+    NAV_FORMAT,
+    RELEVANCE_FORMAT,
+    RELEVANCE_PROMPT,
+    navigation_prompt,
+)
 
 ImageInput = Union[str, Path, bytes]
 
@@ -134,6 +145,11 @@ def _parse_nav(raw: str):
         obj = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return ("stuck", None, "")
+    if not isinstance(obj, dict):
+        # json.loads succeeds on any valid JSON scalar (null, "text", 42,
+        # [1,2,3]) — none of those have .get(), so this must be checked
+        # explicitly or a single degenerate model response crashes the loop.
+        return ("stuck", None, "")
     action = obj.get("action")
     if action not in _VALID_ACTIONS:
         return ("stuck", None, "")
@@ -145,3 +161,53 @@ def _parse_nav(raw: str):
     if action in ("click", "type") and box is None:
         return ("stuck", None, text)
     return (action, box, text)
+
+
+_VALID_RELEVANCE_CATEGORIES = {
+    "retailer", "brand_manufacturer", "marketplace", "informational", "unrelated",
+}
+
+
+# --------------------------------------------------------------------------- #
+# Frame relevance (frozen instrument) — TEXT model, no image.
+# --------------------------------------------------------------------------- #
+def classify_relevance(text: str, model: Optional[str] = None) -> Dict[str, Any]:
+    """Run the frozen relevance prompt on one page's extracted text (title +
+    meta description + h1 + a body excerpt — see common.relevance.build_relevance_text).
+
+    No image is sent; `model` should be a text-capable Ollama tag (default:
+    config models.relevance, currently qwen3.6:27b — a dedicated text model,
+    not a VLM used text-only).
+
+    Returns: {category: str|None, raw: str, latency_ms: int, model: str}.
+    `category` is None if the response was unparseable or not one of the five
+    valid categories — never silently defaulted to "unrelated", so a caller
+    can distinguish "the model said unrelated" from "the response was junk".
+    """
+    model = model or config.load_global()["models"]["relevance"]
+    t0 = time.monotonic()
+    resp = _client().generate(
+        model=model,
+        prompt=f"{RELEVANCE_PROMPT}\n\nPAGE TEXT:\n{text}",
+        format=RELEVANCE_FORMAT,
+        think=False,
+        options={"temperature": 0},
+    )
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    raw = _resp_text(resp).strip()
+    category = _parse_relevance(raw)
+    return {"category": category, "raw": raw, "latency_ms": latency_ms, "model": model}
+
+
+def _parse_relevance(raw: str) -> Optional[str]:
+    try:
+        obj = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        # json.loads succeeds on any valid JSON scalar (null, "text", 42,
+        # [1,2,3]) — none of those have .get(), so this must be checked
+        # explicitly or a single degenerate model response crashes the screen.
+        return None
+    category = obj.get("category")
+    return category if category in _VALID_RELEVANCE_CATEGORIES else None

@@ -12,6 +12,7 @@ __pycache__/
 data/screenshots/
 data/dom/
 data/logs/
+data/html/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm

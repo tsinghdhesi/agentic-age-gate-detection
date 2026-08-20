@@ -1,10 +1,14 @@
 """The model prompts, in ONE place.
 
-DETECTION_PROMPT is a FROZEN measurement instrument. It was signed off by the
-researcher and must not be edited inline anywhere else. Its sha256 is recorded
-per run (runs.detection_prompt_hash) and per detection row, so any change to the
-wording is detectable downstream. If the instrument must ever change, change it
-HERE, deliberately, and treat results under the new hash as a separate measure.
+DETECTION_PROMPT and RELEVANCE_PROMPT are FROZEN measurement instruments.
+They were signed off by the researcher and must not be edited inline
+anywhere else. Their sha256 hashes are recorded per row downstream (per
+detection row for DETECTION_PROMPT_HASH; per sites row for
+RELEVANCE_PROMPT_HASH), so any change to the wording is detectable. If an
+instrument must ever change, change it HERE, deliberately, and treat results
+under the new hash as a separate measure. RELEVANCE_PROMPT determines the
+sampling frame itself — at least as consequential for external validity as
+the detection prompt — and gets the same treatment, not a lighter one.
 
 The navigation prompt is NOT a frozen instrument — it is operational plumbing
 for reaching checkpoints and may be iterated.
@@ -43,6 +47,70 @@ DETECTION_PROMPT = (
 )
 
 DETECTION_PROMPT_HASH = hashlib.sha256(DETECTION_PROMPT.encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# FROZEN — frame-relevance instrument. Do not edit without intent. Determines
+# the sampling frame for 01b_screen_relevance.py / common.vlm.classify_relevance().
+# --------------------------------------------------------------------------- #
+RELEVANCE_PROMPT = (
+    "You are looking at extracted text from a website's home page: its title, "
+    "meta description, main heading, and a portion of the visible body text. "
+    "Decide what kind of site this is, specifically with respect to nicotine "
+    "and e-cigarette products — vapes, e-liquids, disposables, pods, "
+    "cigarettes, cigars, pipe tobacco, snus, nicotine pouches, hookah/shisha "
+    "tobacco.\n"
+    "\n"
+    "Judge the SITE'S PURPOSE from this text REGARDLESS OF THE LANGUAGE IT IS "
+    "WRITTEN IN — a German site about \"E-Zigaretten\" or a Bulgarian site "
+    "about \"никотин\" must be judged by the same standard as an English one. "
+    "MAKE SURE YOUR OUTPUT IS LANGUAGE INVARIANT.\n"
+    "\n"
+    "Choose exactly one category:\n"
+    "- \"retailer\": an online shop that sells nicotine or e-cigarette "
+    "products directly to consumers\n"
+    "- \"brand_manufacturer\": the official site of a nicotine or "
+    "e-cigarette brand or manufacturer, whether or not it sells directly\n"
+    "- \"marketplace\": a general marketplace or classifieds site that "
+    "includes nicotine or e-cigarette listings among other unrelated "
+    "products\n"
+    "- \"informational\": news, blog, forum, review, research, or advocacy "
+    "content about nicotine or vaping that is not itself selling anything\n"
+    "- \"unrelated\": the page has nothing to do with nicotine or "
+    "e-cigarette products\n"
+    "\n"
+    "Be careful: a product or brand NAME that merely contains a "
+    "nicotine-adjacent WORD is not evidence the site sells nicotine products "
+    "— for example a perfume called \"Tobacco Vanille\" (tobacco is a common "
+    "fragrance note), a restaurant named \"Smoke & Grill\", or a BBQ shop "
+    "selling \"smoked\" meats. Judge the site's actual business and content, "
+    "never an incidental word match.\n"
+    "\n"
+    "If the page shows only a placeholder — \"under construction\", \"coming "
+    "soon\", a maintenance notice, a parked-domain page, or is otherwise "
+    "empty of real content — classify it as \"unrelated\", even if the "
+    "domain name or title suggests a nicotine-related business. Judge only "
+    "what the page actually shows right now, never what the domain name "
+    "implies about future or intended content.\n"
+    "\n"
+    "Reply with JSON only, no prose:\n"
+    '{"category": "retailer|brand_manufacturer|marketplace|informational|unrelated"}'
+)
+
+RELEVANCE_PROMPT_HASH = hashlib.sha256(RELEVANCE_PROMPT.encode("utf-8")).hexdigest()
+
+# JSON schema handed to Ollama `format=` for classify_relevance() — mirrors
+# NAV_FORMAT's constrained-generation pattern below.
+RELEVANCE_FORMAT = {
+    "type": "object",
+    "properties": {
+        "category": {
+            "type": "string",
+            "enum": ["retailer", "brand_manufacturer", "marketplace", "informational", "unrelated"],
+        },
+    },
+    "required": ["category"],
+}
 
 
 # --------------------------------------------------------------------------- #
