@@ -25,9 +25,22 @@
 # probability sample — report per-class precision/recall, not overall accuracy
 # as a frame-wide estimate.
 #
-# COUNTS: 150 sites | 51 relevant (1) | 99 irrelevant (0)
-# STRATA: {'gtld': 61, 'eu_west': 27, 'eu_east': 20, 'apac': 13, 'latam': 7, 'uk_ie': 6, 'mena_af': 6, 'na': 5, 'other': 5}
-# ccTLDs: 52 distinct
+# COUNTS (original n=150): 150 sites | 51 relevant (1) | 99 irrelevant (0)
+# STRATA (original n=150): {'gtld': 61, 'eu_west': 27, 'eu_east': 20, 'apac': 13, 'latam': 7, 'uk_ie': 6, 'mena_af': 6, 'na': 5, 'other': 5}
+# ccTLDs (original n=150): 52 distinct
+#
+# COUNTS (full, n=190 after the 2026-08-20 extension below): 190 sites |
+# 66 relevant (1) | 124 irrelevant (0) — 34.7% positive. NOTE: the 40 added
+# rows were pre-filtered by a "likely_rel" keyword hint before fetching (see
+# data/labels/goldset_raw/candidates*.json) and 35/40 carried that hint, so
+# ~45% positive was expected going in; only 15/40 (37.5%) actually turned
+# out relevant on inspection — mostly "juice"/"liquidation" word collisions,
+# domain-parking/for-sale pages, and Cloudflare bot-check interstitials that
+# the keyword hint couldn't distinguish from real retailers. Overall balance
+# barely moved (34.0% -> 34.7%); the keyword pre-filter is not a reliable
+# balance-shifting mechanism, which is itself informative about why 01b uses
+# an LLM judgment rather than a keyword classifier (see CLAUDE.md).
+# STRATA (full, n=190): {'gtld': 73, 'eu_west': 36, 'eu_east': 28, 'apac': 16, 'latam': 8, 'uk_ie': 8, 'mena_af': 7, 'na': 8, 'other': 6}
 #
 # FORMAT: <url><TAB><label><TAB><note>
 # Notes marked BORDERLINE are genuine judgment calls worth reviewing first.
@@ -182,3 +195,53 @@ https://www.sutravape.mx/	1	retailer: vaporizer/510-battery wholesaler, own 21+ 
 https://www.thevipsmokeshop.com/	1	retailer: US smoke shop chain, cigars/hookahs/disposables
 https://www.vapeowave.co.za/	1	retailer: ZA vape shop, mods/tanks/disposables
 https://xsnus.se/	1	retailer: SE snus & vape shop (VELO/FIX/IQOS), cart
+#
+# --- EXTENSION, 2026-08-20: rows 151-190 below, same provenance/method as
+# above (hand-labeled by Claude from already-fetched title/meta/h1/body;
+# same PROVENANCE/CAVEAT header applies). Source candidates were fetched in
+# a prior session and NOT re-crawled for this extension. Two rows
+# (hookahdelivery.ru, delamoreperfume.com) had corrupted/garbled extracted
+# text in the original fetch; both were spot-verified with a fresh
+# common.relevance.fetch() call before labeling (see notes below) rather
+# than guessed from garbage bytes.
+#
+http://snuspro.pics/	0	unrelated: "Country not allowed" geo-block/access-denied page, no content available (domain implies snus retailer, unverifiable)
+https://webdzyners.com/	0	unrelated: placeholder/gibberish page ("DEWAHK" only), no real content
+https://en.thaitobacco.or.th/	0	unrelated: placeholder test stub ("test en.thaitobacco.or.th"), no real content — domain implies Thailand Tobacco Monopoly but page shows only a placeholder (per prompt's placeholder rule)
+https://biancaperfumes.mitiendanube.com/	0	unrelated: perfume shop, suspended by platform (same pattern as europerfumesoficial.mitiendanube.com above)
+https://hookahdelivery.ru/	0	unreachable: original fetch returned garbled/corrupted bytes; re-verified live — site now times out entirely (domain implies hookah retailer, unverifiable)
+http://www.delamoreperfume.com/	0	unrelated: perfume brand page ("...Extrait de Parfum"), garbled charset in the site's own response but content unambiguously fragrance, re-verified live
+https://enjoypizza.ro/	0	unrelated: RO pizza restaurant ('enjoy' word coincidence)
+http://shishapalace.cz/	0	unrelated: Forpsi (CZ hosting/registrar) default parked page, no real shop content despite domain name
+http://luczyn.tv/	0	unrelated: YouTube channel page ('.tv' generic gTLD, personal channel name)
+https://www.dejuicedealer.nl/	0	unrelated: NL cold-pressed fruit/vegetable juice & wellness shop, not e-liquid ('juice' word collision)
+https://www.cigarshop-rudies.jp/	1	retailer: JP cigar e-commerce shop (Rudies), explicit 20+ age verification + tobacco health warning text
+https://vapebarstore.io/	1	retailer: vape shop selling Elf Bar disposables, cart functionality visible
+https://www.huskyvapeshop.ca/	1	retailer: CA vape+cigar shop (Calgary), disposables/e-juices/pods/cigars/hardware
+https://firstvapeshop.es/	0	unrelated: domain-for-sale parking page
+https://www.randmvapestore.de/	0	unrelated: domain auction listing (nicsell), not an actual shop
+https://www.vapeshopmumbai.com/	0	unrelated: domain-for-sale listing (Dynadot), no real shop content
+https://jokervapeshop.com/	1	retailer: JP vape shop (nicotine e-liquid personal-import agency), full nicotine catalogue (devices/pods/nic salts/nic shots)
+https://vapeshop.kiev.ua/	1	retailer: UA e-cigarette shop (Kyiv), full product catalogue visible (VooPoo devices) despite an "orders temporarily paused" notice — same pattern as vapebuddy.ch above
+https://vaporking.gr/	1	retailer: GR e-cigarette/e-liquid shop (Vapor King), own 18+ age gate, free-shipping promo, product categories visible
+https://www.texastileliquidators.com/	0	unrelated: TX floor/tile supply company ('Liquidators' business-clearance name, unrelated to nicotine)
+https://www.eliquidpraha.cz/	1	retailer: CZ e-cigarette/e-liquid shop chain (Eliquidshop.cz), DIY liquid bases & flavours, multiple physical stores
+http://www.thevaporbarstore.com/	1	retailer: US e-liquid/e-cigarette superstore (DFW + online), cart visible, hardware/mods/tanks categories
+https://e-liquid-store.fr/	1	retailer: FR vape/disposable wholesaler (Vapen), Aubervilliers-based, multi-brand catalogue
+https://mp3juice-free-juices-music-downloader.softonic.com.br/	0	unrelated: Cloudflare bot-check interstitial on an MP3/music-download site ('juice' substring collision, irrelevant regardless)
+https://thevapemart.ca/	1	retailer: CA vape shop (E-Liquid/Disposables/Mods), own 19+ DOB age gate + province selector
+https://outletfurnitureliquidation.ca/	0	unrelated: CA furniture liquidation/outlet store ('Liquidation' business-clearance name, unrelated to nicotine)
+https://cigarshop.webnode.hu/	1	retailer: HU cigar shop (webnode-hosted), cigars + accessories, in business since 2012
+https://dneprvapeshop.com.ua/	0	BORDERLINE informational: domain implies a vape shop but the fetched homepage content is a blog article on choosing a bong, no cart/pricing visible in this fetch
+https://villagejuicery.myshopify.com/	0	unrelated: Toronto cold-pressed organic juice/smoothie delivery business, not e-liquid ('juice' word collision)
+http://oneminutejuice.com/	0	unrelated: Namecheap recently-registered-domain placeholder/auction-marketing page, no real content
+https://vaporking.ae/	1	retailer: UAE vape shop (Vaporking Dubai), e-liquids/disposables/mods/pods catalogue
+https://fsvapeshop.co.uk/	1	retailer: UK vape shop (Holborn, Central London), online + physical store, cart visible, full product categories
+http://moma-shishashop.de/	1	retailer: DE shisha/vaping shop (Moma Shisha Shop), shishas/tobacco/charcoal/e-shisha liquids categories, cart present
+https://www.solana-eliquides.fr/	1	brand_manufacturer: FR e-liquid manufacturer (Solana), premium e-liquids, "become a reseller" B2B page + own online shop
+http://www.ktseliquid.eu/	0	unrelated: domain-for-sale page ('ktseliquid.eu' name implies e-liquid but no real content)
+https://vapeclubcrm.ru/	0	unrelated: appears to be an internal CRM/inventory-ordering tool page, not a public-facing product page — cannot confirm consumer retail function from this content
+https://vape-ejuice.com/	0	unrelated: empty WordPress site ("no posts matched your criteria"), no actual content/products despite domain name
+https://norfolkpureapplejuice.co.uk/	0	unrelated: UK apple juice farm (fruit juice production/sales), not e-liquid ('juice' word collision)
+https://1chapeliquide.eu/	0	unrelated: Cloudflare "Just a moment..." bot-check/DDoS-protection interstitial, no real content — domain implies an e-liquid shop but unverifiable
+https://strawhatvapeshop.tokoa.id/	0	unrelated: page shows the underlying e-commerce platform's (Aplikasir/Tokoa) generic marketing content, not the vape shop's actual catalogue

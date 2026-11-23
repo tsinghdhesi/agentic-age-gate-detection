@@ -40,6 +40,34 @@ def load_industry(name: str) -> Dict[str, Any]:
     return _load_yaml(CONFIG_DIR / f"{name}.yaml")
 
 
+# sites.industry (what 01_build_queue.py stamps, inferred from the seed
+# filename) and the config/<name>.yaml FILENAME are two different namespaces
+# that happen to collide for alcohol/gambling but not for nicotine: the
+# default seed is "nicotine-industry-sites.csv" -> sites.industry="nicotine",
+# but the checkpoint config is "vape.yaml" -> industry declares "vape". No
+# existing script has had to bridge this before — every checkpoint-reading
+# script so far (spike_navigation.py) just hardcodes "vape" directly. A
+# collection script filtering `sites` by industry (a DB value) and also
+# loading checkpoints by industry (a config filename) needs both directions
+# reconciled explicitly, or it silently loads the wrong checkpoints / finds
+# zero sites depending on which string it was given.
+_SITES_INDUSTRY_TO_CONFIG_NAME = {
+    "nicotine": "vape",
+    # alcohol/gambling: sites.industry and the config filename already match
+    # (both come from an "<name>-industry-sites.csv" seed convention), so no
+    # entry is needed — the identity fallback below covers them.
+}
+
+
+def config_name_for_sites_industry(industry: str) -> str:
+    """sites.industry value -> config/<name>.yaml filename to load
+    checkpoints from. Identity for any industry not explicitly remapped
+    above (alcohol, gambling — and nicotine's OWN config filename, should a
+    future seed ever be built with --industry nicotine instead of relying
+    on inference from the default filename)."""
+    return _SITES_INDUSTRY_TO_CONFIG_NAME.get(industry, industry)
+
+
 def load(industry: str) -> Dict[str, Any]:
     """Resolved view = global knobs + the industry's checkpoints.
 

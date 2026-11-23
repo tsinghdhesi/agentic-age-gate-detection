@@ -22,7 +22,17 @@ from typing import Iterator, Optional
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = REPO_ROOT / "data" / "agegate.sqlite"
 
-SCHEMA_VERSION = 4  # v4: sites.relevance_fetch_mode ('http'|'browser') records
+SCHEMA_VERSION = 5  # v5: chunk_sets/chunk_members/chunk_runs — addressable,
+                    # resumable work chunks shared by 01b/02/03 (see
+                    # common/chunking.py for the partition math and
+                    # scripts/chunk_work.py for the CLI). chunk_members is
+                    # write-once (trigger-enforced). Also v5:
+                    # sites.relevance_attempts, backing a real
+                    # relevance.max_attempts config cap — previously
+                    # documented on iter_pending_relevance() but not enforced
+                    # anywhere, so unbounded --retry-failed could hammer a
+                    # permanently-dead host forever.
+                    # v4: sites.relevance_fetch_mode ('http'|'browser') records
                     # whether a label came from the plain HTTP GET or from the
                     # JS-render browser fallback (see common/relevance.py).
                     # v3: sites.relevance_ruleset (INTEGER, a deterministic-
@@ -111,7 +121,86 @@ CREATE TABLE IF NOT EXISTS sites (
     http_status          INTEGER,                 -- from the relevance-screen fetch
     sample_u             REAL,                    -- deterministic draw variate; write-once
     sample_wave          INTEGER,                 -- NULL = undrawn; else which wave drew it
+    relevance_attempts   INTEGER NOT NULL DEFAULT 0, -- v5: incremented by set_site_relevance();
+                                                    -- backs relevance.max_attempts (config)
     UNIQUE (url_normalized)
+);
+
+-- v5 — addressable, resumable work chunks shared by 01b_screen_relevance.py
+-- and (later) 02_collect.py/03_classify.py. Three tables for three distinct
+-- lifetimes: set definition (written once), membership (immutable), and
+-- execution record (rewritten per attempt). See common/chunking.py for the
+-- partition math and scripts/chunk_work.py for the CLI.
+--
+-- RULE OF ONE TRUTH: a site's completion state is a property of the site's
+-- OWN row (sites.relevance_prompt_hash / site_outcomes / detections).
+-- chunk_members decides which sites an invocation may TOUCH. chunk_runs
+-- records what HAPPENED. No script may ever read chunk_runs to decide
+-- whether to do work — work selection is always the indexed join
+-- `pending ⋈ chunk_members` (see _pending_relevance_sql below).
+CREATE TABLE IF NOT EXISTS chunk_sets (
+    chunk_set_id      TEXT PRIMARY KEY,
+    intended_consumer TEXT NOT NULL,
+    selector_sql      TEXT,             -- the (validated) predicate chunk_work.py partitioned
+    seed              TEXT NOT NULL,    -- distinct from sampling.frame_salt — see chunking.py
+    chunk_size        INTEGER NOT NULL,
+    created_ts        TEXT,
+    notes             TEXT
+);
+
+-- Write-once: (chunk_set_id, site_id) -> (chunk_index, member_rank,
+-- generation). A partition a later pass could silently re-assign is not
+-- reproducible, so the trigger below aborts any UPDATE outright.
+-- `extend` only ever INSERTs new site_ids as a new generation; existing rows
+-- are never touched.
+CREATE TABLE IF NOT EXISTS chunk_members (
+    chunk_set_id  TEXT NOT NULL,
+    site_id       TEXT NOT NULL,
+    chunk_index   INTEGER NOT NULL,
+    member_rank   INTEGER NOT NULL,   -- 0-based rank WITHIN this chunk, not global
+    generation    INTEGER NOT NULL DEFAULT 0,
+    assigned_ts   TEXT,
+    PRIMARY KEY (chunk_set_id, site_id),
+    FOREIGN KEY (chunk_set_id) REFERENCES chunk_sets(chunk_set_id),
+    FOREIGN KEY (site_id) REFERENCES sites(site_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_chunk_members_immutable
+BEFORE UPDATE ON chunk_members
+BEGIN
+    SELECT RAISE(ABORT, 'chunk_members is write-once; membership must never be reassigned');
+END;
+
+-- Latest-attempt execution summary per (chunk, consumer, scope). `scope` is
+-- what makes this generic across consumers — it holds whatever namespaces
+-- "done" for that consumer (RELEVANCE_PROMPT_HASH for 01b; run_id for 02;
+-- "run_id|model" for 03). A prompt/instrument revision reconciles for free:
+-- the old scope's rows stay "done" forever (a true historical statement
+-- about the old instrument); under the new hash the chunk simply has no row
+-- and reports pending — the PARTITION itself is untouched by the revision.
+-- Invariant #4a: no lease/claim/owner/heartbeat column, and never will be —
+-- this is a scheduling record, not a work-distribution primitive. A stale
+-- `running` row (from a kill -9) is the crash signature, not a lock; the
+-- next run simply overwrites it.
+CREATE TABLE IF NOT EXISTS chunk_runs (
+    chunk_set_id    TEXT NOT NULL,
+    chunk_index     INTEGER NOT NULL,
+    consumer        TEXT NOT NULL,
+    scope           TEXT NOT NULL,
+    status          TEXT,              -- running | done | partial | interrupted
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    n_members       INTEGER,
+    n_pending_start INTEGER,
+    n_pending_end   INTEGER,
+    n_processed     INTEGER,
+    started         TEXT,
+    finished        TEXT,
+    host            TEXT,
+    pid             INTEGER,
+    jsonl_path      TEXT,
+    last_error      TEXT,
+    PRIMARY KEY (chunk_set_id, chunk_index, consumer, scope),
+    FOREIGN KEY (chunk_set_id) REFERENCES chunk_sets(chunk_set_id)
 );
 
 -- One row per (run, site, checkpoint). COLLECTION facts only. NO age-gate label.
@@ -190,6 +279,8 @@ CREATE INDEX IF NOT EXISTS idx_obs_failure         ON observations(failure_reaso
 CREATE INDEX IF NOT EXISTS idx_det_model           ON detections(model);
 CREATE INDEX IF NOT EXISTS idx_det_gate            ON detections(age_gate_detected);
 CREATE INDEX IF NOT EXISTS idx_outcome_status      ON site_outcomes(terminal_status);
+CREATE INDEX IF NOT EXISTS idx_chunk_members_lookup ON chunk_members(chunk_set_id, chunk_index, member_rank);
+CREATE INDEX IF NOT EXISTS idx_chunk_runs_status    ON chunk_runs(chunk_set_id, status);
 """
 
 
@@ -364,6 +455,9 @@ def set_site_relevance(
 ) -> None:
     """The narrow writer for 01b_screen_relevance.py — keeps relevance
     concerns out of upsert_site's frame-writing responsibility. Commits.
+    Increments relevance_attempts unconditionally (every call here IS an
+    attempt — live screen or --reclassify), which is what lets
+    relevance.max_attempts cap a permanently-dead host's retry count.
     """
     conn.execute(
         """
@@ -375,7 +469,8 @@ def set_site_relevance(
             relevance_prompt_hash  = ?,
             relevance_fetch_mode   = ?,
             relevance_ts           = ?,
-            http_status            = ?
+            http_status            = ?,
+            relevance_attempts     = relevance_attempts + 1
         WHERE site_id = ?
         """,
         (relevance_label, included, relevance_score, relevance_model,
@@ -384,36 +479,263 @@ def set_site_relevance(
     conn.commit()
 
 
+def _pending_relevance_sql(
+    *,
+    prompt_hash: str,
+    industry: Optional[str] = None,
+    retry_failed: bool = False,
+    max_attempts: Optional[int] = None,
+    chunk_set: Optional[str] = None,
+    chunk_index: Optional[int] = None,
+) -> tuple[str, str, list, str]:
+    """The SINGLE definition of "pending" for relevance screening, shared by
+    iter_pending_relevance() and count_pending_relevance() so the queue can
+    never drift into two different definitions. Returns
+    (from_sql, where_sql, params, order_sql) — callers compose their own
+    SELECT list around it.
+
+    chunk_set/chunk_index restrict to one chunk's membership via an indexed
+    join on chunk_members — this IS the "pending ⋈ chunk_members" join the
+    Rule of One Truth (CLAUDE.md) requires; chunk_runs is never consulted
+    here or anywhere in the pending-queue definition.
+
+    retry_failed re-queues rows whose previous attempt was
+    unreachable/blocked/error; max_attempts (when given) additionally caps
+    those re-queued rows to sites.relevance_attempts < max_attempts, so a
+    permanently-dead host stops being re-queued instead of blocking a chunk
+    from ever reaching "done" forever.
+    """
+    from_sql = "sites"
+    params: list = [prompt_hash]
+    base_clause = "(sites.relevance_prompt_hash IS NULL OR sites.relevance_prompt_hash != ?)"
+    if retry_failed:
+        failed_clause = "sites.relevance_label IN ('unreachable', 'blocked', 'error')"
+        if max_attempts is not None:
+            failed_clause += " AND sites.relevance_attempts < ?"
+        base_clause = f"({base_clause} OR ({failed_clause}))"
+        if max_attempts is not None:
+            params.append(max_attempts)
+    clauses = [base_clause]
+
+    if industry is not None:
+        clauses.append("sites.industry = ?")
+        params.append(industry)
+
+    order_sql = "sites.sample_stratum, sites.site_id"
+    if chunk_set is not None:
+        from_sql = "sites JOIN chunk_members ON chunk_members.site_id = sites.site_id"
+        clauses.append("chunk_members.chunk_set_id = ?")
+        params.append(chunk_set)
+        if chunk_index is not None:
+            clauses.append("chunk_members.chunk_index = ?")
+            params.append(chunk_index)
+        order_sql = "chunk_members.chunk_index, chunk_members.member_rank"
+
+    where_sql = " AND ".join(clauses)
+    return from_sql, where_sql, params, order_sql
+
+
 def iter_pending_relevance(
     conn: sqlite3.Connection,
     *,
     prompt_hash: str,
     industry: Optional[str] = None,
     retry_failed: bool = False,
+    max_attempts: Optional[int] = None,
+    chunk_set: Optional[str] = None,
+    chunk_index: Optional[int] = None,
 ) -> Iterator[sqlite3.Row]:
     """Work queue for 01b: frame rows not yet classified under the CURRENT
     RELEVANCE_PROMPT. No cursor file needed — resumability comes from the
     data itself (relevance_prompt_hash lags the live prompt's hash, e.g.
     after a deliberate prompt revision — see common.prompts.RELEVANCE_PROMPT_HASH).
-    retry_failed also re-queues rows whose previous attempt was
-    unreachable/blocked/error, up to config relevance.max_attempts (enforced
-    by the caller, not here).
+    See _pending_relevance_sql for retry_failed/max_attempts/chunk_set semantics.
+
+    Without chunk_set, ordered by (sample_stratum, site_id) — 01b's own
+    _interleave_by_stratum then round-robins this into a per-stratum-balanced
+    sequence. WITH chunk_set, ordered by (chunk_index, member_rank) instead:
+    a chunk's membership is already a uniformly random permutation of the
+    frame (see common.chunking.partition), so ANY prefix of it is an unbiased
+    subsample — round-robin interleaving is not needed and is bypassed by
+    the chunked caller.
     """
-    clauses = ["(relevance_prompt_hash IS NULL OR relevance_prompt_hash != ?)"]
-    params: list = [prompt_hash]
-    if retry_failed:
-        clauses[-1] = (
-            "(relevance_prompt_hash IS NULL OR relevance_prompt_hash != ? "
-            "OR relevance_label IN ('unreachable', 'blocked', 'error'))"
-        )
-    if industry is not None:
-        clauses.append("industry = ?")
-        params.append(industry)
-    where = " AND ".join(clauses)
-    cur = conn.execute(
-        f"SELECT * FROM sites WHERE {where} ORDER BY sample_stratum, site_id", params
+    from_sql, where_sql, params, order_sql = _pending_relevance_sql(
+        prompt_hash=prompt_hash, industry=industry, retry_failed=retry_failed,
+        max_attempts=max_attempts, chunk_set=chunk_set, chunk_index=chunk_index,
     )
+    cur = conn.execute(f"SELECT sites.* FROM {from_sql} WHERE {where_sql} ORDER BY {order_sql}", params)
     yield from cur
+
+
+def count_pending_relevance(
+    conn: sqlite3.Connection,
+    *,
+    prompt_hash: str,
+    industry: Optional[str] = None,
+    retry_failed: bool = False,
+    max_attempts: Optional[int] = None,
+    chunk_set: Optional[str] = None,
+    chunk_index: Optional[int] = None,
+) -> int:
+    """COUNT(*) form of iter_pending_relevance() — same _pending_relevance_sql
+    builder, so the two definitions of "pending" can never disagree. Used for
+    chunk_runs.n_pending_start/n_pending_end and chunk_work.py status, which
+    must derive chunk status by re-running this count, never by reading
+    chunk_runs itself (Rule of One Truth).
+    """
+    from_sql, where_sql, params, _ = _pending_relevance_sql(
+        prompt_hash=prompt_hash, industry=industry, retry_failed=retry_failed,
+        max_attempts=max_attempts, chunk_set=chunk_set, chunk_index=chunk_index,
+    )
+    cur = conn.execute(f"SELECT COUNT(*) AS n FROM {from_sql} WHERE {where_sql}", params)
+    return cur.fetchone()["n"]
+
+
+def next_pending_chunk_index(
+    conn: sqlite3.Connection,
+    chunk_set_id: str,
+    *,
+    prompt_hash: str,
+    industry: Optional[str] = None,
+    retry_failed: bool = False,
+    max_attempts: Optional[int] = None,
+) -> Optional[int]:
+    """What `--chunk next` resolves to: the LOWEST chunk_index in this set
+    that has at least one pending member under the current default queue
+    definition. Derived from the same pending ⋈ chunk_members join as
+    iter_pending_relevance() / count_pending_relevance() — deliberately does
+    NOT consult chunk_runs, which would make the convenience flag a second,
+    disagreeable source of truth (Rule of One Truth). Returns None if every
+    chunk in the set is fully processed.
+    """
+    from_sql, where_sql, params, _ = _pending_relevance_sql(
+        prompt_hash=prompt_hash, industry=industry, retry_failed=retry_failed,
+        max_attempts=max_attempts, chunk_set=chunk_set_id,
+    )
+    cur = conn.execute(f"SELECT MIN(chunk_members.chunk_index) AS c FROM {from_sql} WHERE {where_sql}", params)
+    row = cur.fetchone()
+    return row["c"] if row is not None else None
+
+
+# --------------------------------------------------------------------------- #
+# collection pending queue (02_collect*.py) — scope=run_id, doneness lives in
+# site_outcomes(run_id, site_id). Mirrors _pending_relevance_sql's shape
+# exactly so the two consumers stay structurally consistent, but is a
+# genuinely separate builder (not a dispatching wrapper) because the
+# underlying join is different in kind: relevance checks a column ON the
+# sites row itself (relevance_prompt_hash); collection checks whether a
+# SEPARATE table's row exists at all for this run.
+# --------------------------------------------------------------------------- #
+def _pending_collect_sql(
+    *,
+    run_id: str,
+    industry: Optional[str] = None,
+    retry_blocked: bool = False,
+    chunk_set: Optional[str] = None,
+    chunk_index: Optional[int] = None,
+) -> tuple[str, str, list, str]:
+    """The SINGLE definition of "pending" for the funnel crawl. "Pending" =
+    no site_outcomes row yet for THIS run_id; retry_blocked widens that to
+    also re-queue sites whose prior outcome for this run was
+    dropped_blocked (mirrors --retry-failed's widening in
+    _pending_relevance_sql exactly).
+
+    Unlike 01b, there is no "whole frame" population for collection — the
+    drawn-sample restriction (included=1 AND sample_wave IS NOT NULL) is
+    baked into chunk MEMBERSHIP at chunk-creation time by
+    `chunk_work.py create --preset drawn-sample`, not enforced here. A call
+    without chunk_set therefore iterates the WHOLE sites table, which is
+    only useful for tests — scripts/02_collect_browseruse.py's own contract
+    is to always pass chunk_set/chunk_index in real use.
+    """
+    from_sql = (
+        "sites LEFT JOIN site_outcomes "
+        "ON site_outcomes.run_id = ? AND site_outcomes.site_id = sites.site_id"
+    )
+    params: list = [run_id]
+    base_clause = "site_outcomes.site_id IS NULL"
+    if retry_blocked:
+        base_clause = f"({base_clause} OR site_outcomes.terminal_status = 'dropped_blocked')"
+    clauses = [base_clause]
+
+    if industry is not None:
+        clauses.append("sites.industry = ?")
+        params.append(industry)
+
+    order_sql = "sites.site_id"
+    if chunk_set is not None:
+        from_sql += " JOIN chunk_members ON chunk_members.site_id = sites.site_id"
+        clauses.append("chunk_members.chunk_set_id = ?")
+        params.append(chunk_set)
+        if chunk_index is not None:
+            clauses.append("chunk_members.chunk_index = ?")
+            params.append(chunk_index)
+        order_sql = "chunk_members.chunk_index, chunk_members.member_rank"
+
+    where_sql = " AND ".join(clauses)
+    return from_sql, where_sql, params, order_sql
+
+
+def iter_pending_collect(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    industry: Optional[str] = None,
+    retry_blocked: bool = False,
+    chunk_set: Optional[str] = None,
+    chunk_index: Optional[int] = None,
+) -> Iterator[sqlite3.Row]:
+    """Work queue for the funnel crawl: sites in the given chunk with no
+    site_outcomes row yet for run_id. See _pending_collect_sql for
+    retry_blocked/chunk_set semantics."""
+    from_sql, where_sql, params, order_sql = _pending_collect_sql(
+        run_id=run_id, industry=industry, retry_blocked=retry_blocked,
+        chunk_set=chunk_set, chunk_index=chunk_index,
+    )
+    cur = conn.execute(f"SELECT sites.* FROM {from_sql} WHERE {where_sql} ORDER BY {order_sql}", params)
+    yield from cur
+
+
+def count_pending_collect(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    industry: Optional[str] = None,
+    retry_blocked: bool = False,
+    chunk_set: Optional[str] = None,
+    chunk_index: Optional[int] = None,
+) -> int:
+    """COUNT(*) form of iter_pending_collect() — same builder, so the two
+    definitions of "pending" can never disagree. Used for chunk_runs status
+    derivation and chunk_work.py status for consumer=02_collect."""
+    from_sql, where_sql, params, _ = _pending_collect_sql(
+        run_id=run_id, industry=industry, retry_blocked=retry_blocked,
+        chunk_set=chunk_set, chunk_index=chunk_index,
+    )
+    cur = conn.execute(f"SELECT COUNT(*) AS n FROM {from_sql} WHERE {where_sql}", params)
+    return cur.fetchone()["n"]
+
+
+def next_pending_collect_chunk_index(
+    conn: sqlite3.Connection,
+    chunk_set_id: str,
+    *,
+    run_id: str,
+    industry: Optional[str] = None,
+    retry_blocked: bool = False,
+) -> Optional[int]:
+    """`--chunk next` for the collection consumer: the lowest chunk_index
+    with at least one pending member for this run_id. Sibling of
+    next_pending_chunk_index (relevance) rather than a dispatching wrapper —
+    each stays a straight-line read of its own SQL, matching the existing
+    per-consumer builder split. Never consults chunk_runs (Rule of One Truth).
+    """
+    from_sql, where_sql, params, _ = _pending_collect_sql(
+        run_id=run_id, industry=industry, retry_blocked=retry_blocked, chunk_set=chunk_set_id,
+    )
+    cur = conn.execute(f"SELECT MIN(chunk_members.chunk_index) AS c FROM {from_sql} WHERE {where_sql}", params)
+    row = cur.fetchone()
+    return row["c"] if row is not None else None
 
 
 # --------------------------------------------------------------------------- #
@@ -493,6 +815,254 @@ def iter_undrawn_relevant_sites(
         f"SELECT * FROM sites WHERE {' AND '.join(clauses)} ORDER BY sample_stratum, sample_u",
         params,
     )
+    yield from cur
+
+
+# --------------------------------------------------------------------------- #
+# chunking (schema v5, common/chunking.py, scripts/chunk_work.py)
+#
+# RULE OF ONE TRUTH: chunk_members decides which sites an invocation may
+# TOUCH (via the pending ⋈ chunk_members join above). chunk_runs records what
+# HAPPENED. No function below is ever consulted by a work loop to decide
+# whether to do work — only iter_pending_relevance/count_pending_relevance/
+# next_pending_chunk_index (which join chunk_members, never chunk_runs) are.
+# --------------------------------------------------------------------------- #
+def create_chunk_set(
+    conn: sqlite3.Connection,
+    *,
+    chunk_set_id: str,
+    intended_consumer: str,
+    seed: str,
+    chunk_size: int,
+    selector_sql: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> None:
+    """Register a new chunk set. Raises sqlite3.IntegrityError on a duplicate
+    chunk_set_id — sets are not meant to be silently redefined; use `extend`
+    (a new generation, same id) to grow one instead.
+    """
+    conn.execute(
+        """
+        INSERT INTO chunk_sets (chunk_set_id, intended_consumer, selector_sql,
+                                seed, chunk_size, created_ts, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (chunk_set_id, intended_consumer, selector_sql, seed, chunk_size, now_iso(), notes),
+    )
+    conn.commit()
+
+
+def get_chunk_set(conn: sqlite3.Connection, chunk_set_id: str) -> Optional[sqlite3.Row]:
+    cur = conn.execute("SELECT * FROM chunk_sets WHERE chunk_set_id = ?", (chunk_set_id,))
+    return cur.fetchone()
+
+
+def insert_chunk_members(
+    conn: sqlite3.Connection,
+    chunk_set_id: str,
+    assignments: list[tuple[str, int, int, int]],
+) -> None:
+    """assignments = [(site_id, chunk_index, member_rank, generation), ...],
+    exactly common.chunking.partition()'s return shape. Relies on the
+    write-once trigger (trg_chunk_members_immutable) to abort outright if a
+    site_id already belongs to this set — a normal `create`/`extend` only
+    ever inserts site_ids that were excluded from the partition input
+    (existing_member_site_ids), so this should never fire in practice; if it
+    does, that's a real bug in the caller, not something to swallow. Commits.
+    """
+    conn.executemany(
+        """
+        INSERT INTO chunk_members (chunk_set_id, site_id, chunk_index,
+                                   member_rank, generation, assigned_ts)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [(chunk_set_id, site_id, chunk_index, member_rank, generation, now_iso())
+         for site_id, chunk_index, member_rank, generation in assignments],
+    )
+    conn.commit()
+
+
+def iter_chunk_members(
+    conn: sqlite3.Connection, chunk_set_id: str, chunk_index: Optional[int] = None
+) -> Iterator[sqlite3.Row]:
+    """All members of a set, or just one chunk, ordered by member_rank.
+    Used by chunk_work.py verify/status, not by the 01b work loop itself
+    (which reads via iter_pending_relevance's join instead)."""
+    if chunk_index is None:
+        cur = conn.execute(
+            "SELECT * FROM chunk_members WHERE chunk_set_id = ? ORDER BY chunk_index, member_rank",
+            (chunk_set_id,),
+        )
+    else:
+        cur = conn.execute(
+            "SELECT * FROM chunk_members WHERE chunk_set_id = ? AND chunk_index = ? ORDER BY member_rank",
+            (chunk_set_id, chunk_index),
+        )
+    yield from cur
+
+
+def chunk_indices(conn: sqlite3.Connection, chunk_set_id: str) -> list[int]:
+    cur = conn.execute(
+        "SELECT DISTINCT chunk_index FROM chunk_members WHERE chunk_set_id = ? ORDER BY chunk_index",
+        (chunk_set_id,),
+    )
+    return [row["chunk_index"] for row in cur]
+
+
+def max_chunk_index(conn: sqlite3.Connection, chunk_set_id: str) -> Optional[int]:
+    row = conn.execute(
+        "SELECT MAX(chunk_index) AS m FROM chunk_members WHERE chunk_set_id = ?", (chunk_set_id,)
+    ).fetchone()
+    return row["m"]
+
+
+def max_generation(conn: sqlite3.Connection, chunk_set_id: str) -> Optional[int]:
+    row = conn.execute(
+        "SELECT MAX(generation) AS g FROM chunk_members WHERE chunk_set_id = ?", (chunk_set_id,)
+    ).fetchone()
+    return row["g"]
+
+
+def existing_member_site_ids(conn: sqlite3.Connection, chunk_set_id: str) -> set[str]:
+    """Every site_id already assigned in this set, across all generations —
+    what `chunk_work.py extend` must exclude before partitioning the
+    complement as a new generation."""
+    cur = conn.execute("SELECT site_id FROM chunk_members WHERE chunk_set_id = ?", (chunk_set_id,))
+    return {row["site_id"] for row in cur}
+
+
+def unstamp_relevance(conn: sqlite3.Connection, site_ids: list[str]) -> None:
+    """The deliberate, auditable redo path for `chunk_work.py unstamp`: clears
+    relevance_prompt_hash for these sites so they re-enter the pending queue
+    under the CURRENT hash, without touching relevance_label/score/etc — the
+    old label stays visible as a historical record until the site is
+    actually re-screened. Callers MUST dump the pre-clear row to JSONL before
+    calling this (chunk_work.py does); this function itself does not log.
+    Commits.
+    """
+    conn.executemany(
+        "UPDATE sites SET relevance_prompt_hash = NULL WHERE site_id = ?",
+        [(site_id,) for site_id in site_ids],
+    )
+    conn.commit()
+
+
+def iter_sites_with_stratum(
+    conn: sqlite3.Connection, *, where_sql: Optional[str] = None, params: Optional[list] = None
+) -> Iterator[sqlite3.Row]:
+    """(site_id, sample_stratum) for chunk_work.py's partition input and its
+    --dry-run per-chunk stratum table. `where_sql` is a caller-VALIDATED
+    predicate fragment (chunk_work.py rejects `;` and DDL/DML keywords before
+    it ever reaches here, mirroring the delete-everything plan's `--where`
+    safety note) — this function trusts its caller, it does not re-validate.
+    """
+    sql = "SELECT site_id, sample_stratum FROM sites"
+    if where_sql:
+        sql += f" WHERE {where_sql}"
+    cur = conn.execute(sql, params or [])
+    yield from cur
+
+
+def start_chunk_run(
+    conn: sqlite3.Connection,
+    *,
+    chunk_set_id: str,
+    chunk_index: int,
+    consumer: str,
+    scope: str,
+    n_members: int,
+    n_pending_start: int,
+    host: Optional[str] = None,
+    pid: Optional[int] = None,
+    jsonl_path: Optional[str] = None,
+) -> None:
+    """Mark (chunk, consumer, scope) as 'running', bumping `attempts`. A
+    stale 'running' row left by a `kill -9` is simply overwritten here — per
+    invariant #4a, chunk_runs has no lease/claim/heartbeat and this call must
+    NEVER block on one; printing a loud warning about a stale row (if found)
+    is the caller's job, not this function's.
+    """
+    conn.execute(
+        """
+        INSERT INTO chunk_runs (chunk_set_id, chunk_index, consumer, scope, status,
+                                attempts, n_members, n_pending_start, n_pending_end,
+                                n_processed, started, finished, host, pid, jsonl_path, last_error)
+        VALUES (?, ?, ?, ?, 'running', 1, ?, ?, NULL, 0, ?, NULL, ?, ?, ?, NULL)
+        ON CONFLICT(chunk_set_id, chunk_index, consumer, scope) DO UPDATE SET
+            status          = 'running',
+            attempts        = chunk_runs.attempts + 1,
+            n_members       = excluded.n_members,
+            n_pending_start = excluded.n_pending_start,
+            n_pending_end   = NULL,
+            n_processed     = 0,
+            started         = excluded.started,
+            finished        = NULL,
+            host            = excluded.host,
+            pid             = excluded.pid,
+            jsonl_path      = excluded.jsonl_path,
+            last_error      = NULL
+        """,
+        (chunk_set_id, chunk_index, consumer, scope, n_members, n_pending_start,
+         now_iso(), host, pid, jsonl_path),
+    )
+    conn.commit()
+
+
+def finish_chunk_run(
+    conn: sqlite3.Connection,
+    *,
+    chunk_set_id: str,
+    chunk_index: int,
+    consumer: str,
+    scope: str,
+    status: str,
+    n_pending_end: int,
+    n_processed: int,
+    last_error: Optional[str] = None,
+) -> None:
+    """status must be derived by the CALLER from a fresh count_pending_relevance
+    call ("done" if n_pending_end == 0 else "partial"/"interrupted") — never
+    inferred here from "the loop reached the end" (Rule of One Truth)."""
+    conn.execute(
+        """
+        UPDATE chunk_runs SET
+            status        = ?,
+            n_pending_end = ?,
+            n_processed   = ?,
+            finished      = ?,
+            last_error    = ?
+        WHERE chunk_set_id = ? AND chunk_index = ? AND consumer = ? AND scope = ?
+        """,
+        (status, n_pending_end, n_processed, now_iso(), last_error,
+         chunk_set_id, chunk_index, consumer, scope),
+    )
+    conn.commit()
+
+
+def get_chunk_run(
+    conn: sqlite3.Connection, *, chunk_set_id: str, chunk_index: int, consumer: str, scope: str
+) -> Optional[sqlite3.Row]:
+    cur = conn.execute(
+        "SELECT * FROM chunk_runs WHERE chunk_set_id = ? AND chunk_index = ? AND consumer = ? AND scope = ?",
+        (chunk_set_id, chunk_index, consumer, scope),
+    )
+    return cur.fetchone()
+
+
+def iter_chunk_runs(
+    conn: sqlite3.Connection, chunk_set_id: str, *, consumer: Optional[str] = None
+) -> Iterator[sqlite3.Row]:
+    """Every recorded run for a set, for chunk_work.py status — display only,
+    never consulted to decide pending work (Rule of One Truth)."""
+    if consumer is None:
+        cur = conn.execute(
+            "SELECT * FROM chunk_runs WHERE chunk_set_id = ? ORDER BY chunk_index, scope", (chunk_set_id,)
+        )
+    else:
+        cur = conn.execute(
+            "SELECT * FROM chunk_runs WHERE chunk_set_id = ? AND consumer = ? ORDER BY chunk_index, scope",
+            (chunk_set_id, consumer),
+        )
     yield from cur
 
 

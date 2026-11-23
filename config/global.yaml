@@ -73,6 +73,13 @@ relevance:
   timeout_s: 10
   max_response_bytes: 5000000       # 5 MB cap; stop reading past this
   inter_request_delay_s: 1.0        # polite spacing between hosts, one GET each
+  # Caps --retry-failed re-attempts per site (unreachable/blocked/error only —
+  # a fresh, never-attempted site or one whose relevance_prompt_hash is stale
+  # is unaffected). Without this, --retry-failed inside a chunk would hammer
+  # a permanently-dead host forever and that chunk could never reach "done"
+  # (db.py's iter_pending_relevance docstring promised this cap before it
+  # existed — see schema v5 / sites.relevance_attempts).
+  max_attempts: 3
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
   max_body_chars: 3000              # truncate extracted body text fed to the LLM
   # JS-render fallback. A plain HTTP GET sees nothing on a fully client-rendered
@@ -102,3 +109,45 @@ sampling:
   power: 0.5
   stratum_floor: 30
   waves: 2
+
+# Addressable work-chunk partitioning (scripts/chunk_work.py, common/chunking.py).
+# chunk_seed is DELIBERATELY DISTINCT from sampling.frame_salt above — reusing
+# it would entangle the sampling design with operational scheduling and make
+# chunk 0 exactly the sites 01c_draw_sample.py draws first.
+chunking:
+  chunk_seed: "agegate-2026-chunk-v1"
+  chunk_size_01b: 2500     # ~4h/chunk at measured 5.6s/site, 47 chunks over the frame
+  chunk_size_02: 50        # ~2.2h/chunk at ~2.6min/site funnel walk
+
+# scripts/02_collect_browseruse.py's navigation engine — a SEPARATE local
+# backend from Ollama above, used ONLY because bu-30b-a3b-preview (a
+# Qwen3-VL-30B-A3B-Instruct fine-tune) isn't available on Ollama. This does
+# NOT replace models.navigation: qwen3.6:27b (relevance) and qwen3-vl:30b
+# (detection, and any future native-loop navigation) stay on Ollama,
+# untouched — both are frozen, validated instruments, and moving either to a
+# different inference backend is not guaranteed to reproduce Ollama's
+# outputs even with "the same" weights (different quantization/kernels),
+# which would mean re-validating from scratch for no requested benefit.
+# mlx/mlx-vlm are NOT a dependency of this repo — they run as an
+# independent local server process, like Ollama, in whatever separate
+# environment you already have them installed in. See CLAUDE.md for the
+# exact server command and its verification status.
+navigation_bu:
+  llm_base_url: "http://localhost:8080/v1"
+  # Verified real on Hugging Face (2026-08-23): browser-use's own published
+  # fine-tune (base_model: browser-use/bu-30b-a3b-preview), quantized to MLX
+  # 4-bit by mlx-community. qwen3_vl_moe architecture, image-text-to-text
+  # (vision-capable) — confirmed via the HF Hub API, not assumed. ~18.3 GB,
+  # downloaded and cached by mlx_vlm.server on first request referencing it
+  # (no --model flag needed at server startup — confirmed by starting the
+  # server bare and hitting /v1/models).
+  llm_model: "mlx-community/bu-30b-a3b-preview-4bit"
+  max_steps_per_checkpoint: 6
+  # DIAGNOSTIC values (2026-08-23), raised from an initial 60/60 after live
+  # testing: this model's per-step structured output (memory/eval/plan
+  # reasoning embedded IN the regular JSON fields, not gated by
+  # use_thinking=False) varies wildly in length — some steps ~4s, others
+  # exceed 8192 tokens. 60s was insufficient even with thinking disabled.
+  # Not yet confirmed sufficient at these values either — see CLAUDE.md.
+  step_timeout: 180        # seconds, per browser-use agent step
+  llm_timeout: 180         # seconds, per LLM call

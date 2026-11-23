@@ -88,3 +88,57 @@ def capture_for(
         return {"viewport": viewport(page, viewport_path)}
 
     raise ValueError(f"unknown capture purpose: {purpose!r}")
+
+
+# --------------------------------------------------------------------------- #
+# Async siblings — same contract, for callers on the async Playwright API
+# (playwright.async_api.Page). Needed by scripts/02_collect_browseruse.py:
+# browser-use's own architecture is fully async, and a sync page.screenshot()
+# call cannot be made from inside an already-running asyncio event loop.
+# Every future async collection engine should use these, not re-implement
+# capture logic locally — this stays the one place the strategy lives.
+# --------------------------------------------------------------------------- #
+async def async_viewport(page: Any, out_path: Path | str) -> Path:
+    p = _ensure_parent(out_path)
+    await page.screenshot(path=str(p), full_page=False)
+    return p
+
+
+async def async_full_page(page: Any, out_path: Path | str) -> Path:
+    p = _ensure_parent(out_path)
+    await page.screenshot(path=str(p), full_page=True)
+    return p
+
+
+async def async_capture_for(
+    page: Any,
+    purpose: str,
+    *,
+    fullpage_path: Path | str | None = None,
+    viewport_path: Path | str | None = None,
+) -> Dict[str, Path]:
+    """Async version of capture_for() — same purpose/path contract."""
+    if purpose == "navigation":
+        if viewport_path is None:
+            raise ValueError("navigation capture requires viewport_path")
+        return {"viewport": await async_viewport(page, viewport_path)}
+
+    if purpose == "collection":
+        if fullpage_path is None or viewport_path is None:
+            raise ValueError("collection capture requires both paths")
+        return {
+            "fullpage": await async_full_page(page, fullpage_path),
+            "viewport": await async_viewport(page, viewport_path),
+        }
+
+    if purpose == "detection":
+        kind = detection_capture_kind()
+        if kind == "full_page":
+            if fullpage_path is None:
+                raise ValueError("detection (full_page) requires fullpage_path")
+            return {"fullpage": await async_full_page(page, fullpage_path)}
+        if viewport_path is None:
+            raise ValueError("detection (viewport) requires viewport_path")
+        return {"viewport": await async_viewport(page, viewport_path)}
+
+    raise ValueError(f"unknown capture purpose: {purpose!r}")

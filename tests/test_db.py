@@ -240,6 +240,52 @@ def test_set_site_relevance_commits(conn):
     assert conn2_row["relevance_label"] == "unrelated"
 
 
+def test_set_site_relevance_increments_attempts(conn):
+    _upsert_frame_site(conn)
+    assert db.get_site(conn, "vape_co_uk_abc123")["relevance_attempts"] == 0
+    db.set_site_relevance(conn, "vape_co_uk_abc123", relevance_label="unrelated", included=0)
+    assert db.get_site(conn, "vape_co_uk_abc123")["relevance_attempts"] == 1
+    db.set_site_relevance(conn, "vape_co_uk_abc123", relevance_label="unrelated", included=0)
+    assert db.get_site(conn, "vape_co_uk_abc123")["relevance_attempts"] == 2
+
+
+def test_iter_pending_relevance_retry_failed_respects_max_attempts(conn):
+    _upsert_frame_site(conn, site_id="a")
+    # 3 attempts, still failing every time
+    for _ in range(3):
+        db.set_site_relevance(conn, "a", relevance_label="blocked", included=0, relevance_prompt_hash="hash_v1")
+
+    under_cap = [
+        r["site_id"] for r in db.iter_pending_relevance(
+            conn, prompt_hash="hash_v1", retry_failed=True, max_attempts=5,
+        )
+    ]
+    at_cap = [
+        r["site_id"] for r in db.iter_pending_relevance(
+            conn, prompt_hash="hash_v1", retry_failed=True, max_attempts=3,
+        )
+    ]
+    assert under_cap == ["a"]
+    assert at_cap == []  # a permanently-dead host must stop being re-queued
+
+
+def test_count_pending_relevance_agrees_with_iter(conn):
+    _upsert_frame_site(conn, site_id="a")
+    _upsert_frame_site(conn, site_id="b")
+    db.set_site_relevance(conn, "a", relevance_label="blocked", included=0, relevance_prompt_hash="hash_v1")
+
+    for kwargs in (
+        dict(prompt_hash="hash_v1"),
+        dict(prompt_hash="hash_v1", retry_failed=True),
+        dict(prompt_hash="hash_v1", retry_failed=True, max_attempts=1),
+        dict(prompt_hash="hash_v1", industry="nicotine"),
+        dict(prompt_hash="hash_v2"),
+    ):
+        n_iter = len(list(db.iter_pending_relevance(conn, **kwargs)))
+        n_count = db.count_pending_relevance(conn, **kwargs)
+        assert n_iter == n_count, kwargs
+
+
 # --------------------------------------------------------------------------- #
 # set_site_sample_u / mark_sites_drawn — write-once semantics
 # --------------------------------------------------------------------------- #
@@ -418,3 +464,345 @@ def test_upsert_site_outcome_roundtrip(conn):
         ("run1", "vape_co_uk_abc123"),
     ).fetchone()
     assert row["terminal_status"] == "completed"
+
+
+# --------------------------------------------------------------------------- #
+# chunking (schema v5): chunk_sets / chunk_members / chunk_runs
+# --------------------------------------------------------------------------- #
+
+
+def _seed_sites(conn, n, prefix="site"):
+    ids = [f"{prefix}{i}" for i in range(n)]
+    for site_id in ids:
+        _upsert_frame_site(conn, site_id=site_id)
+    conn.commit()
+    return ids
+
+
+def _make_chunk_set(conn, chunk_set_id="cs1", n_sites=10, chunk_size=4, seed="seed1"):
+    ids = _seed_sites(conn, n_sites)
+    db.create_chunk_set(conn, chunk_set_id=chunk_set_id, intended_consumer="01b_screen_relevance",
+                        seed=seed, chunk_size=chunk_size)
+    from common.chunking import partition
+
+    db.insert_chunk_members(conn, chunk_set_id, partition(ids, seed=seed, chunk_size=chunk_size))
+    return ids
+
+
+def test_create_chunk_set_and_get(conn):
+    db.create_chunk_set(conn, chunk_set_id="cs1", intended_consumer="01b_screen_relevance",
+                        seed="seed1", chunk_size=100, notes="pilot")
+    row = db.get_chunk_set(conn, "cs1")
+    assert row["intended_consumer"] == "01b_screen_relevance"
+    assert row["chunk_size"] == 100
+    assert row["notes"] == "pilot"
+
+
+def test_create_chunk_set_duplicate_id_raises(conn):
+    db.create_chunk_set(conn, chunk_set_id="cs1", intended_consumer="01b_screen_relevance",
+                        seed="seed1", chunk_size=100)
+    with pytest.raises(sqlite3.IntegrityError):
+        db.create_chunk_set(conn, chunk_set_id="cs1", intended_consumer="01b_screen_relevance",
+                            seed="seed1", chunk_size=100)
+
+
+def test_insert_and_iter_chunk_members(conn):
+    ids = _make_chunk_set(conn, n_sites=10, chunk_size=4)
+    all_members = [r["site_id"] for r in db.iter_chunk_members(conn, "cs1")]
+    assert sorted(all_members) == sorted(ids)
+    assert db.chunk_indices(conn, "cs1") == [0, 1, 2]
+    assert db.max_chunk_index(conn, "cs1") == 2
+    assert db.max_generation(conn, "cs1") == 0
+
+
+def test_iter_chunk_members_single_chunk_ordered_by_rank(conn):
+    _make_chunk_set(conn, n_sites=10, chunk_size=4)
+    chunk0 = list(db.iter_chunk_members(conn, "cs1", 0))
+    ranks = [r["member_rank"] for r in chunk0]
+    assert ranks == sorted(ranks) == list(range(len(chunk0)))
+
+
+def test_chunk_members_write_once_trigger_aborts_update(conn):
+    _make_chunk_set(conn, n_sites=10, chunk_size=4)
+    site_id = db.chunk_indices(conn, "cs1") and list(db.iter_chunk_members(conn, "cs1", 0))[0]["site_id"]
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE chunk_members SET member_rank = 999 WHERE chunk_set_id = ? AND site_id = ?",
+            ("cs1", site_id),
+        )
+
+
+def test_existing_member_site_ids(conn):
+    ids = _make_chunk_set(conn, n_sites=10, chunk_size=4)
+    assert db.existing_member_site_ids(conn, "cs1") == set(ids)
+
+
+def test_extend_adds_new_generation_without_touching_existing(conn):
+    ids = _make_chunk_set(conn, n_sites=10, chunk_size=4)
+    before = {(r["site_id"], r["chunk_index"], r["member_rank"], r["generation"])
+              for r in db.iter_chunk_members(conn, "cs1")}
+
+    new_ids = _seed_sites(conn, 6, prefix="new")
+    from common.chunking import partition
+
+    next_gen = db.max_generation(conn, "cs1") + 1
+    next_idx = db.max_chunk_index(conn, "cs1") + 1
+    assignments = partition(new_ids, seed="seed1", chunk_size=4, generation=next_gen, first_chunk_index=next_idx)
+    db.insert_chunk_members(conn, "cs1", assignments)
+
+    after = {(r["site_id"], r["chunk_index"], r["member_rank"], r["generation"])
+             for r in db.iter_chunk_members(conn, "cs1")}
+    assert before <= after  # existing membership untouched
+    assert db.existing_member_site_ids(conn, "cs1") == set(ids) | set(new_ids)
+    assert db.max_generation(conn, "cs1") == next_gen
+
+
+def test_iter_sites_with_stratum(conn):
+    _upsert_frame_site(conn, site_id="a", sample_stratum="uk_ie")
+    _upsert_frame_site(conn, site_id="b", sample_stratum="gtld")
+    rows = {r["site_id"]: r["sample_stratum"] for r in db.iter_sites_with_stratum(conn)}
+    assert rows == {"a": "uk_ie", "b": "gtld"}
+
+
+def test_iter_sites_with_stratum_where_filter(conn):
+    _upsert_frame_site(conn, site_id="a", industry="nicotine")
+    _upsert_frame_site(conn, site_id="b", industry="alcohol")
+    rows = list(db.iter_sites_with_stratum(conn, where_sql="industry = ?", params=["alcohol"]))
+    assert [r["site_id"] for r in rows] == ["b"]
+
+
+def test_pending_relevance_chunk_join_restricts_to_one_chunk(conn):
+    _make_chunk_set(conn, n_sites=10, chunk_size=4)
+    chunk0_ids = {r["site_id"] for r in db.iter_chunk_members(conn, "cs1", 0)}
+
+    pending = [r["site_id"] for r in db.iter_pending_relevance(
+        conn, prompt_hash="hash_v1", chunk_set="cs1", chunk_index=0,
+    )]
+    assert set(pending) == chunk0_ids
+    assert db.count_pending_relevance(conn, prompt_hash="hash_v1", chunk_set="cs1", chunk_index=0) == len(chunk0_ids)
+
+
+def test_pending_relevance_chunk_join_orders_by_member_rank(conn):
+    _make_chunk_set(conn, n_sites=10, chunk_size=4)
+    pending = list(db.iter_pending_relevance(conn, prompt_hash="hash_v1", chunk_set="cs1", chunk_index=0))
+    members_by_rank = {r["site_id"]: r["member_rank"] for r in db.iter_chunk_members(conn, "cs1", 0)}
+    ranks = [members_by_rank[r["site_id"]] for r in pending]
+    assert ranks == sorted(ranks)
+
+
+def test_next_pending_chunk_index_advances_as_chunks_complete(conn):
+    _make_chunk_set(conn, n_sites=10, chunk_size=4)
+    assert db.next_pending_chunk_index(conn, "cs1", prompt_hash="hash_v1") == 0
+
+    for r in db.iter_chunk_members(conn, "cs1", 0):
+        db.set_site_relevance(conn, r["site_id"], relevance_label="unrelated", included=0,
+                              relevance_prompt_hash="hash_v1")
+    assert db.next_pending_chunk_index(conn, "cs1", prompt_hash="hash_v1") == 1
+
+    for idx in (1, 2):
+        for r in db.iter_chunk_members(conn, "cs1", idx):
+            db.set_site_relevance(conn, r["site_id"], relevance_label="unrelated", included=0,
+                                  relevance_prompt_hash="hash_v1")
+    assert db.next_pending_chunk_index(conn, "cs1", prompt_hash="hash_v1") is None
+
+
+def test_next_pending_chunk_index_does_not_consult_chunk_runs(conn):
+    """The Rule of One Truth: --chunk next must resolve purely from the
+    pending ⋈ chunk_members join, never from chunk_runs.status. Simulate a
+    chunk marked 'done' in chunk_runs whose sites were never actually
+    screened (e.g. a bogus/forged row) — it must still be reported pending.
+    """
+    _make_chunk_set(conn, n_sites=10, chunk_size=4)
+    db.start_chunk_run(conn, chunk_set_id="cs1", chunk_index=0, consumer="01b_screen_relevance",
+                       scope="hash_v1", n_members=4, n_pending_start=4)
+    db.finish_chunk_run(conn, chunk_set_id="cs1", chunk_index=0, consumer="01b_screen_relevance",
+                        scope="hash_v1", status="done", n_pending_end=0, n_processed=4)
+    # No sites were actually screened (relevance_prompt_hash still NULL).
+    assert db.next_pending_chunk_index(conn, "cs1", prompt_hash="hash_v1") == 0
+
+
+def test_start_and_finish_chunk_run_lifecycle(conn):
+    _make_chunk_set(conn, n_sites=10, chunk_size=4)
+    db.start_chunk_run(conn, chunk_set_id="cs1", chunk_index=0, consumer="01b_screen_relevance",
+                       scope="hash_v1", n_members=4, n_pending_start=4, host="mac", pid=42,
+                       jsonl_path="c00000.jsonl")
+    row = db.get_chunk_run(conn, chunk_set_id="cs1", chunk_index=0, consumer="01b_screen_relevance", scope="hash_v1")
+    assert row["status"] == "running"
+    assert row["attempts"] == 1
+    assert row["finished"] is None
+
+    db.finish_chunk_run(conn, chunk_set_id="cs1", chunk_index=0, consumer="01b_screen_relevance",
+                        scope="hash_v1", status="partial", n_pending_end=2, n_processed=2,
+                        last_error="interrupted")
+    row = db.get_chunk_run(conn, chunk_set_id="cs1", chunk_index=0, consumer="01b_screen_relevance", scope="hash_v1")
+    assert row["status"] == "partial"
+    assert row["n_pending_end"] == 2
+    assert row["finished"] is not None
+    assert row["last_error"] == "interrupted"
+
+
+def test_start_chunk_run_overwrites_stale_running_row(conn):
+    """A kill -9 leaves a 'running' row behind. It is NOT a lock — the next
+    invocation must simply overwrite it, bumping attempts, never block."""
+    _make_chunk_set(conn, n_sites=10, chunk_size=4)
+    db.start_chunk_run(conn, chunk_set_id="cs1", chunk_index=0, consumer="01b_screen_relevance",
+                       scope="hash_v1", n_members=4, n_pending_start=4)
+    # never finished (simulated crash) — start again
+    db.start_chunk_run(conn, chunk_set_id="cs1", chunk_index=0, consumer="01b_screen_relevance",
+                       scope="hash_v1", n_members=4, n_pending_start=4)
+    row = db.get_chunk_run(conn, chunk_set_id="cs1", chunk_index=0, consumer="01b_screen_relevance", scope="hash_v1")
+    assert row["status"] == "running"
+    assert row["attempts"] == 2
+
+
+def test_iter_chunk_runs(conn):
+    _make_chunk_set(conn, n_sites=10, chunk_size=4)
+    for idx in (0, 1):
+        db.start_chunk_run(conn, chunk_set_id="cs1", chunk_index=idx, consumer="01b_screen_relevance",
+                           scope="hash_v1", n_members=4, n_pending_start=4)
+        db.finish_chunk_run(conn, chunk_set_id="cs1", chunk_index=idx, consumer="01b_screen_relevance",
+                            scope="hash_v1", status="done", n_pending_end=0, n_processed=4)
+    runs = list(db.iter_chunk_runs(conn, "cs1"))
+    assert [r["chunk_index"] for r in runs] == [0, 1]
+    assert all(r["status"] == "done" for r in runs)
+
+
+def test_chunk_runs_scope_reconciles_prompt_revision():
+    """A frozen-prompt revision must reconcile with zero cleanup: the OLD
+    scope's chunk_runs row stays 'done' forever (a true historical statement
+    about the old instrument); under the NEW hash the same chunk reports
+    pending again, entirely from the sites-table join — chunk_runs for the
+    new scope simply doesn't exist yet, and that absence IS "pending"."""
+    c = db.connect(":memory:")
+    db.init_db(c)
+    ids = _make_chunk_set(c, n_sites=4, chunk_size=4, seed="seed1")
+    for site_id in ids:
+        db.set_site_relevance(c, site_id, relevance_label="unrelated", included=0,
+                              relevance_prompt_hash="hash_v1")
+    db.start_chunk_run(c, chunk_set_id="cs1", chunk_index=0, consumer="01b_screen_relevance",
+                       scope="hash_v1", n_members=4, n_pending_start=4)
+    db.finish_chunk_run(c, chunk_set_id="cs1", chunk_index=0, consumer="01b_screen_relevance",
+                        scope="hash_v1", status="done", n_pending_end=0, n_processed=4)
+
+    # Old scope: done, and genuinely 0 pending.
+    old_run = db.get_chunk_run(c, chunk_set_id="cs1", chunk_index=0, consumer="01b_screen_relevance", scope="hash_v1")
+    assert old_run["status"] == "done"
+    assert db.count_pending_relevance(c, prompt_hash="hash_v1", chunk_set="cs1", chunk_index=0) == 0
+
+    # New scope (revised prompt hash): no chunk_runs row at all, and the
+    # SAME partition (chunk_members untouched) reports fully pending again.
+    new_run = db.get_chunk_run(c, chunk_set_id="cs1", chunk_index=0, consumer="01b_screen_relevance", scope="hash_v2")
+    assert new_run is None
+    assert db.count_pending_relevance(c, prompt_hash="hash_v2", chunk_set="cs1", chunk_index=0) == 4
+    c.close()
+
+
+# --------------------------------------------------------------------------- #
+# collection pending queue (scope=run_id) — iter_pending_collect /
+# count_pending_collect / next_pending_collect_chunk_index
+# --------------------------------------------------------------------------- #
+
+
+def test_iter_pending_collect_returns_sites_with_no_outcome(conn):
+    _upsert_frame_site(conn, site_id="a")
+    _upsert_frame_site(conn, site_id="b")
+    db.start_run(conn, "run1")
+    db.upsert_site_outcome(conn, run_id="run1", site_id="a",
+                           max_checkpoint_reached="cart", terminal_status="completed")
+
+    pending = [r["site_id"] for r in db.iter_pending_collect(conn, run_id="run1")]
+    assert pending == ["b"]
+
+
+def test_iter_pending_collect_is_scoped_per_run(conn):
+    _upsert_frame_site(conn, site_id="a")
+    db.start_run(conn, "run1")
+    db.start_run(conn, "run2")
+    db.upsert_site_outcome(conn, run_id="run1", site_id="a",
+                           max_checkpoint_reached="cart", terminal_status="completed")
+
+    assert list(db.iter_pending_collect(conn, run_id="run1")) == []
+    assert [r["site_id"] for r in db.iter_pending_collect(conn, run_id="run2")] == ["a"]
+
+
+def test_iter_pending_collect_retry_blocked(conn):
+    _upsert_frame_site(conn, site_id="a")
+    _upsert_frame_site(conn, site_id="b")
+    db.start_run(conn, "run1")
+    db.upsert_site_outcome(conn, run_id="run1", site_id="a",
+                           max_checkpoint_reached="cart", terminal_status="completed")
+    db.upsert_site_outcome(conn, run_id="run1", site_id="b",
+                           max_checkpoint_reached="store", terminal_status="dropped_blocked",
+                           drop_checkpoint="store", drop_reason="blocked_bot")
+
+    without_retry = [r["site_id"] for r in db.iter_pending_collect(conn, run_id="run1")]
+    with_retry = [r["site_id"] for r in db.iter_pending_collect(conn, run_id="run1", retry_blocked=True)]
+    assert without_retry == []
+    assert with_retry == ["b"]
+
+
+def test_iter_pending_collect_filters_by_industry(conn):
+    _upsert_frame_site(conn, site_id="a", industry="nicotine")
+    _upsert_frame_site(conn, site_id="b", industry="alcohol")
+    db.start_run(conn, "run1")
+    pending = [r["site_id"] for r in db.iter_pending_collect(conn, run_id="run1", industry="alcohol")]
+    assert pending == ["b"]
+
+
+def test_count_pending_collect_agrees_with_iter(conn):
+    _upsert_frame_site(conn, site_id="a")
+    _upsert_frame_site(conn, site_id="b")
+    db.start_run(conn, "run1")
+    db.upsert_site_outcome(conn, run_id="run1", site_id="a",
+                           max_checkpoint_reached="store", terminal_status="dropped_blocked",
+                           drop_checkpoint="store", drop_reason="blocked_bot")
+
+    for kwargs in (
+        dict(run_id="run1"),
+        dict(run_id="run1", retry_blocked=True),
+        dict(run_id="run1", industry="nicotine"),
+    ):
+        assert db.count_pending_collect(conn, **kwargs) == len(list(db.iter_pending_collect(conn, **kwargs)))
+
+
+def test_pending_collect_chunk_join_restricts_to_one_chunk(conn):
+    ids = _make_chunk_set(conn, chunk_set_id="collect1", n_sites=10, chunk_size=4)
+    db.start_run(conn, "run1")
+    chunk0_ids = {r["site_id"] for r in db.iter_chunk_members(conn, "collect1", 0)}
+
+    pending = [r["site_id"] for r in db.iter_pending_collect(
+        conn, run_id="run1", chunk_set="collect1", chunk_index=0,
+    )]
+    assert set(pending) == chunk0_ids
+    assert db.count_pending_collect(conn, run_id="run1", chunk_set="collect1", chunk_index=0) == len(chunk0_ids)
+    assert set(ids) >= chunk0_ids  # sanity: chunk0 is a subset of the full set
+
+
+def test_next_pending_collect_chunk_index_advances_as_chunks_complete(conn):
+    _make_chunk_set(conn, chunk_set_id="collect1", n_sites=10, chunk_size=4)
+    db.start_run(conn, "run1")
+    assert db.next_pending_collect_chunk_index(conn, "collect1", run_id="run1") == 0
+
+    for r in db.iter_chunk_members(conn, "collect1", 0):
+        db.upsert_site_outcome(conn, run_id="run1", site_id=r["site_id"],
+                               max_checkpoint_reached="cart", terminal_status="completed")
+    assert db.next_pending_collect_chunk_index(conn, "collect1", run_id="run1") == 1
+
+    for idx in (1, 2):
+        for r in db.iter_chunk_members(conn, "collect1", idx):
+            db.upsert_site_outcome(conn, run_id="run1", site_id=r["site_id"],
+                                   max_checkpoint_reached="cart", terminal_status="completed")
+    assert db.next_pending_collect_chunk_index(conn, "collect1", run_id="run1") is None
+
+
+def test_next_pending_collect_chunk_index_does_not_consult_chunk_runs(conn):
+    """Rule of One Truth: a bogus 'done' chunk_runs row for this run must not
+    hide genuinely pending sites — only site_outcomes existence decides."""
+    _make_chunk_set(conn, chunk_set_id="collect1", n_sites=10, chunk_size=4)
+    db.start_run(conn, "run1")
+    db.start_chunk_run(conn, chunk_set_id="collect1", chunk_index=0, consumer="02_collect",
+                       scope="run1", n_members=4, n_pending_start=4)
+    db.finish_chunk_run(conn, chunk_set_id="collect1", chunk_index=0, consumer="02_collect",
+                        scope="run1", status="done", n_pending_end=0, n_processed=4)
+    # No site_outcomes rows were actually written for run1.
+    assert db.next_pending_collect_chunk_index(conn, "collect1", run_id="run1") == 0

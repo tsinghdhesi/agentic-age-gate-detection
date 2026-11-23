@@ -1,8 +1,24 @@
 # Agentic age-gate detection pipeline — dependencies.
 #
-# HARD INVARIANT: inference is LOCAL Ollama only. There is NO cloud fallback.
-# Do not add openai / anthropic / google-generativeai / cohere / mistralai /
-# langchain or any hosted-LLM SDK to this file, ever.
+# HARD INVARIANT: inference is LOCAL only, no data ever leaves the machine.
+# The invariant is about NETWORK DESTINATION, not package names — every LLM
+# client actually constructed in this repo is pointed at localhost (Ollama
+# at :11434, or a local MLX server for scripts/02_collect_browseruse.py).
+# Do not construct a client for a REAL cloud provider (openai.OpenAI(),
+# anthropic.Anthropic(), etc. pointed at their default hosted base_url, or
+# langchain wired to one) anywhere in this codebase, ever — no cloud
+# fallback, no exceptions.
+#
+# NOTE on browser-use below: it unconditionally depends on openai, anthropic,
+# google-genai (+ the google-api/-auth stack), and groq as CORE dependencies
+# at every released version back to 0.1.0 — it supports many LLM backends
+# and ships all their client SDKs regardless of which one you actually use;
+# there is no lighter extras group that excludes them. Installing it means
+# those packages exist in this environment. This repo only ever constructs
+# `browser_use.ChatOpenAI(base_url="http://localhost:<port>/v1", api_key="not-needed")`
+# — no client from any of those other SDKs is ever instantiated, and
+# ANONYMIZED_TELEMETRY=false is set at process start (browser-use also
+# phones home via PostHog by default). See CLAUDE.md for the full accounting.
 
 # --- Runtime ---
 playwright>=1.49           # browser automation (run: playwright install chromium)
@@ -11,6 +27,7 @@ ollama>=0.4.0              # local Ollama HTTP client (localhost:11434)
 PyYAML>=6.0                # config loader
 tldextract>=5.1            # registrable domain + exact public suffix (offline PSL)
 Pillow>=10.4               # spike: draw predicted click points onto screenshots
+browser-use==0.13.8        # scripts/02_collect_browseruse.py's Agent/BrowserSession — see note above re: bundled SDKs
 
 # --- Dev / test ---
 pytest>=8.0                # coords rescale unit test (load-bearing)

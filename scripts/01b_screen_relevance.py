@@ -45,7 +45,10 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import json
 import os
+import socket
+import subprocess
 import sys
 import time
 from collections import defaultdict, deque
@@ -60,6 +63,8 @@ from common.relevance import FetchResult, classify_page, fetch  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HTML_DIR = REPO_ROOT / "data" / "html"
+CHUNK_LOG_DIR = REPO_ROOT / "data" / "logs" / "chunks"
+CONSUMER = "01b_screen_relevance"
 
 
 class _BrowserRenderer:
@@ -171,6 +176,10 @@ def _to_row(result: dict, relevance_cfg: dict, http_status: Optional[int]) -> di
     (no LLM was actually called for those) — it marks "processed under this
     01b pass," which is what makes a fetch-failed site correctly drop out of
     the default pending queue while still being reachable via --retry-failed.
+
+    The returned dict carries one extra key, `_latency_ms`, that is NOT a
+    db.set_site_relevance() parameter — it's per-chunk JSONL telemetry only.
+    The caller pops it before the DB write; see main()'s chunked logging path.
     """
     category = result["category"] or "unparseable"
     included = 1 if category in relevance_cfg["include_categories"] else 0
@@ -181,6 +190,7 @@ def _to_row(result: dict, relevance_cfg: dict, http_status: Optional[int]) -> di
         relevance_prompt_hash=RELEVANCE_PROMPT_HASH,
         relevance_fetch_mode=result.get("fetch_mode"),
         http_status=http_status,
+        _latency_ms=result.get("latency_ms"),
     )
 
 
@@ -221,6 +231,30 @@ def _reclassify_one(site: object, relevance_cfg: dict,
     return _to_row(result, relevance_cfg, site["http_status"])
 
 
+def _git_sha() -> Optional[str]:
+    """Best-effort git HEAD sha for chunk JSONL provenance. None on any
+    failure (no git installed, not a repo, detached weirdness) — this is
+    telemetry, never allowed to break a multi-day screen."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True,
+            text=True, timeout=5, check=True,
+        )
+        return out.stdout.strip()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _chunk_jsonl_path(chunk_set_id: str, chunk_index: int, scope: str) -> Path:
+    """data/logs/chunks/<set>/c<idx:05d>__<consumer>__<scope[:12]>__<ts>.jsonl —
+    one file PER ATTEMPT (the ts makes each start_chunk_run call get its own
+    file), so a crash and its resume are both preserved rather than one
+    overwriting the other."""
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    name = f"c{chunk_index:05d}__{CONSUMER}__{scope[:12]}__{ts}.jsonl"
+    return CHUNK_LOG_DIR / chunk_set_id / name
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", type=Path, default=db.DEFAULT_DB)
@@ -230,24 +264,76 @@ def main() -> None:
     ap.add_argument("--reclassify", action="store_true", help="re-score stored HTML (still an LLM call per site; thin pages may re-render)")
     ap.add_argument("--no-browser-fallback", action="store_true", help="disable the JS re-render for thin pages")
     ap.add_argument("--dry-run", action="store_true", help="report the work queue size and exit")
+    ap.add_argument("--chunk-set", dest="chunk_set", default=None,
+                    help="chunk set id (see scripts/chunk_work.py create) — restricts work to one chunk of it")
+    ap.add_argument("--chunk", default=None,
+                    help="chunk index within --chunk-set, or 'next' for the lowest chunk with pending work")
     args = ap.parse_args()
+
+    if (args.chunk_set is None) != (args.chunk is None):
+        ap.error("--chunk-set and --chunk must be given together")
 
     relevance_cfg = dict(config.load_global()["relevance"])
     if args.no_browser_fallback:
         relevance_cfg["browser_fallback"] = False
+    # Caps --retry-failed re-attempts on unreachable/blocked/error sites (see
+    # schema v5 / sites.relevance_attempts) — applies whether or not --chunk
+    # is used; a fresh or stale-hash site is unaffected either way.
+    max_attempts = relevance_cfg.get("max_attempts")
 
     conn = db.connect(args.db)
     db.init_db(conn)
 
+    chunk_set_id = args.chunk_set
+    chunk_index: Optional[int] = None
+    if chunk_set_id is not None:
+        if db.get_chunk_set(conn, chunk_set_id) is None:
+            print(f"ERROR: no such chunk set {chunk_set_id!r} — create it with "
+                  "scripts/chunk_work.py create", file=sys.stderr)
+            conn.close()
+            sys.exit(1)
+        if args.chunk == "next":
+            chunk_index = db.next_pending_chunk_index(
+                conn, chunk_set_id, prompt_hash=RELEVANCE_PROMPT_HASH, industry=args.industry,
+                retry_failed=args.retry_failed, max_attempts=max_attempts,
+            )
+            if chunk_index is None:
+                print(f"01b_screen_relevance — chunk set {chunk_set_id!r}: every chunk is "
+                      "already fully processed under the current queue definition. Nothing to do.")
+                conn.close()
+                return
+        else:
+            try:
+                chunk_index = int(args.chunk)
+            except ValueError:
+                ap.error("--chunk must be an integer or 'next'")
+
     pending = list(db.iter_pending_relevance(
         conn, prompt_hash=RELEVANCE_PROMPT_HASH, industry=args.industry,
-        retry_failed=args.retry_failed,
+        retry_failed=args.retry_failed, max_attempts=max_attempts,
+        chunk_set=chunk_set_id, chunk_index=chunk_index,
     ))
-    pending = list(_interleave_by_stratum(pending))
+    if chunk_set_id is None:
+        pending = list(_interleave_by_stratum(pending))
+    # else: chunk membership (common.chunking.partition) is already a
+    # uniformly random permutation of the frame, and iter_pending_relevance
+    # already ordered this by member_rank — round-robin interleaving is
+    # neither needed (any prefix is already an unbiased subsample) nor
+    # correct here (it would destroy that ordering).
+
+    # A completed chunk re-run is a LOUD NO-OP that exits 0, so a
+    # `for i in $(seq 0 46); do ...; done` driver is idempotent and
+    # restartable without special-casing "already done" at the shell level.
+    if chunk_set_id is not None and not pending:
+        print(f"01b_screen_relevance — chunk {chunk_index} of {chunk_set_id!r}: "
+              "nothing pending for this invocation's flags. Already done — no-op.")
+        conn.close()
+        return
 
     fb = "on" if relevance_cfg.get("browser_fallback") else "off"
+    chunk_info = f" chunk_set={chunk_set_id!r} chunk={chunk_index}" if chunk_set_id is not None else ""
     print(f"01b_screen_relevance — model={config.load_global()['models']['relevance']} "
-          f"prompt_hash={RELEVANCE_PROMPT_HASH[:12]} pending={len(pending)} "
+          f"prompt_hash={RELEVANCE_PROMPT_HASH[:12]} pending={len(pending)}{chunk_info} "
           f"browser_fallback={fb}"
           f"{'  [RECLASSIFY]' if args.reclassify else ''}"
           f"{'  [DRY RUN]' if args.dry_run else ''}")
@@ -256,40 +342,133 @@ def main() -> None:
         conn.close()
         return
 
+    n_pending_start = len(pending)  # BEFORE --limit truncation — the true queue size this chunk saw
     if args.limit is not None:
         pending = pending[: args.limit]
 
-    processed = skipped = 0
+    # Chunked-run bookkeeping: JSONL log + chunk_runs lifecycle. None of this
+    # runs on the non-chunked path, which stays exactly as before (zero files
+    # written, no chunk_runs row).
+    jsonl_file = None
+    chunk_scope = RELEVANCE_PROMPT_HASH
+    if chunk_set_id is not None:
+        prior_run = db.get_chunk_run(
+            conn, chunk_set_id=chunk_set_id, chunk_index=chunk_index, consumer=CONSUMER, scope=chunk_scope,
+        )
+        if prior_run is not None and prior_run["status"] == "running":
+            print(f"WARNING: chunk {chunk_index} of {chunk_set_id!r} has a stale 'running' row "
+                  f"(attempt {prior_run['attempts']}, started {prior_run['started']}, "
+                  f"host={prior_run['host']} pid={prior_run['pid']}) — a prior process likely "
+                  "crashed. chunk_runs is not a lock; overwriting it, NOT blocking.")
+
+        n_members = len(list(db.iter_chunk_members(conn, chunk_set_id, chunk_index)))
+        jsonl_path = _chunk_jsonl_path(chunk_set_id, chunk_index, chunk_scope)
+        jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        jsonl_file = open(jsonl_path, "w", encoding="utf-8")
+
+        db.start_chunk_run(
+            conn, chunk_set_id=chunk_set_id, chunk_index=chunk_index, consumer=CONSUMER,
+            scope=chunk_scope, n_members=n_members, n_pending_start=n_pending_start,
+            host=socket.gethostname(), pid=os.getpid(),
+            jsonl_path=str(jsonl_path.relative_to(REPO_ROOT)),
+        )
+        jsonl_file.write(json.dumps({
+            "type": "meta", "chunk_set": chunk_set_id, "chunk_index": chunk_index,
+            "consumer": CONSUMER, "scope": chunk_scope, "n_members": n_members,
+            "n_pending_start": n_pending_start, "limit": args.limit,
+            "retry_failed": args.retry_failed, "reclassify": args.reclassify,
+            "industry": args.industry, "no_browser_fallback": args.no_browser_fallback,
+            "max_attempts": max_attempts, "model": config.load_global()["models"]["relevance"],
+            "prompt_hash": RELEVANCE_PROMPT_HASH, "git_sha": _git_sha(), "ts": db.now_iso(),
+        }) + "\n")
+        jsonl_file.flush()
+
+    processed = skipped = skipped_no_html = 0
     label_counts: dict = {}
     include_categories = set(relevance_cfg["include_categories"])
     renderer = _BrowserRenderer(relevance_cfg) if relevance_cfg.get("browser_fallback") else None
     t0 = time.time()
+    last_error: Optional[str] = None
 
-    for i, site in enumerate(pending, start=1):
-        if args.reclassify:
-            result = _reclassify_one(site, relevance_cfg, renderer)
-            if result is None:
-                skipped += 1
-                continue
-        else:
-            result = _screen_one(site, relevance_cfg, renderer)
-            time.sleep(relevance_cfg["inter_request_delay_s"])
+    try:
+        for i, site in enumerate(pending, start=1):
+            if args.reclassify:
+                result = _reclassify_one(site, relevance_cfg, renderer)
+                if result is None:
+                    skipped += 1
+                    skipped_no_html += 1
+                    continue
+            else:
+                result = _screen_one(site, relevance_cfg, renderer)
+                time.sleep(relevance_cfg["inter_request_delay_s"])
 
-        db.set_site_relevance(conn, site["site_id"], **result)
-        processed += 1
-        label = result["relevance_label"]
-        label_counts[label] = label_counts.get(label, 0) + 1
+            latency_ms = result.pop("_latency_ms", None)
+            db.set_site_relevance(conn, site["site_id"], **result)
+            processed += 1
+            label = result["relevance_label"]
+            label_counts[label] = label_counts.get(label, 0) + 1
 
-        if i % 100 == 0 or i == len(pending):
-            elapsed = time.time() - t0
-            rate = elapsed / i
-            included_so_far = sum(v for k, v in label_counts.items() if k in include_categories)
-            yield_pct = 100 * included_so_far / max(1, processed)
-            print(f"  {i}/{len(pending)}  {rate:.2f}s/site  included={included_so_far} ({yield_pct:.1f}% yield)")
+            if jsonl_file is not None:
+                jsonl_file.write(json.dumps({
+                    "type": "site", "site_id": site["site_id"], "url": site["url_normalized"],
+                    "relevance_label": label, "included": result["included"],
+                    "http_status": result["http_status"], "fetch_mode": result["relevance_fetch_mode"],
+                    "latency_ms": latency_ms, "ts": db.now_iso(),
+                }) + "\n")
+                jsonl_file.flush()
+
+            if i % 100 == 0 or i == len(pending):
+                elapsed = time.time() - t0
+                rate = elapsed / i
+                included_so_far = sum(v for k, v in label_counts.items() if k in include_categories)
+                yield_pct = 100 * included_so_far / max(1, processed)
+                print(f"  {i}/{len(pending)}  {rate:.2f}s/site  included={included_so_far} ({yield_pct:.1f}% yield)")
+    except KeyboardInterrupt:
+        last_error = "KeyboardInterrupt"
+        raise
+    except Exception as e:  # noqa: BLE001 — must still finish the chunk_run record before propagating
+        last_error = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        if renderer is not None:
+            renderer.close()
+        if chunk_set_id is not None:
+            # Status is ALWAYS derived from the BASE queue definition (prompt
+            # hash only — no retry_failed/industry), regardless of which
+            # flags THIS invocation used to select its own work. Otherwise a
+            # --retry-failed or --industry run could regress an
+            # already-"done" chunk back to "partial" just because it looked
+            # at a wider or narrower slice than the default.
+            remaining = db.count_pending_relevance(
+                conn, prompt_hash=RELEVANCE_PROMPT_HASH, chunk_set=chunk_set_id, chunk_index=chunk_index,
+            )
+            if skipped_no_html and remaining:
+                note = (f"{skipped_no_html} site(s) skipped: no stored HTML "
+                        "(a --reclassify-only pass can't process them — run without "
+                        "--reclassify at least once first)")
+                last_error = f"{last_error}; {note}" if last_error else note
+            if last_error is not None:
+                status = "interrupted"
+            elif remaining == 0:
+                status = "done"
+            else:
+                status = "partial"
+            db.finish_chunk_run(
+                conn, chunk_set_id=chunk_set_id, chunk_index=chunk_index, consumer=CONSUMER,
+                scope=chunk_scope, status=status, n_pending_end=remaining,
+                n_processed=processed, last_error=last_error,
+            )
+            if jsonl_file is not None:
+                jsonl_file.write(json.dumps({
+                    "type": "summary", "status": status, "n_processed": processed,
+                    "n_pending_end": remaining, "skipped_no_html": skipped_no_html,
+                    "last_error": last_error, "ts": db.now_iso(),
+                }) + "\n")
+                jsonl_file.close()
+            print(f"\nchunk {chunk_index} of {chunk_set_id!r}: status={status} "
+                  f"processed={processed} pending_remaining={remaining}")
 
     conn.close()
-    if renderer is not None:
-        renderer.close()
 
     dt = time.time() - t0
     print(f"\nprocessed {processed} sites in {dt:.1f}s ({dt/max(1, processed):.2f}s/site avg)"

@@ -21,14 +21,16 @@ playwright install chromium
 ## Layout
 - `common/` — shared library (schema, config, coords, VLM client, …). Imported, never run.
 - `config/` — `global.yaml` + per-industry checkpoint configs.
-- `scripts/` — `01_build_queue` → `02_collect` → `03_classify` → `04_classify_blocks` → `05_analyze`.
+- `scripts/` — numbered pipeline stages: `01_build_queue` → `01b_screen_relevance` → `01c_draw_sample` → `02_collect` → `03_classify` → `04_classify_blocks` → `05_analyze`.
+  Plus two unnumbered scripts: `chunk_work.py` (resumable work chunks, used by several stages) and `02_collect_browseruse.py` (a second navigation engine, parallel to `02_collect`).
 - `spike/` — Day-1 grounding / detection validation.
 - `label_ui/` — minimal local manual-review page.
-- `data/` — seed inputs (tracked); screenshots / DOM / logs / SQLite (generated, gitignored).
+- `data/` — seed inputs and the hand-labeled relevance gold set (tracked). Run outputs (screenshots / DOM / HTML / logs / SQLite) and raw gold-set fetches are generated and gitignored.
+- `tests/` — pytest suite.
 
 ## Verify the build
 ```bash
-python -m pytest -q            # coords rescale unit test
+python -m pytest -q            # full unit test suite
 python -c "from common import db; c=db.connect(); db.init_db(c); print('schema ok')"
 ```
 
